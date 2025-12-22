@@ -1,0 +1,72 @@
+package worker
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+
+	"{{ .GoModuleName }}/internal/core/service"
+)
+
+// {{ .EntityName }}Event represents the payload structure for this topic.
+type {{ .EntityName }}Event struct {
+	ID string `json:"id"`
+	// Add other fields here...
+}
+
+// Validate checks if the event payload has all required fields.
+func (e *{{ .EntityName }}Event) Validate() error {
+	if e.ID == "" {
+		return fmt.Errorf("missing required field: id")
+	}
+	return nil
+}
+
+type {{ .EntityName }}Consumer struct {
+	logger *slog.Logger
+	svc    *service.{{ .EntityName }}Service
+}
+
+func New{{ .EntityName }}Consumer(svc *service.{{ .EntityName }}Service) *{{ .EntityName }}Consumer {
+	return &{{ .EntityName }}Consumer{
+		logger: slog.Default().With(
+			"worker", "{{ .EntityName }}Consumer",
+			"topic", "{{ .Topic }}",
+		),
+		svc: svc,
+	}
+}
+
+// CONTRACT:
+// - Return nil: Success OR Poison Pill (Commit Offset).
+// - Return error: Transient Failure (Trigger Framework Retry).
+func (c *{{ .EntityName }}Consumer) Handle(ctx context.Context, key, payload []byte) error {
+	var event {{ .EntityName }}Event
+
+	// POISON PILL CHECK
+	// Malformed JSON or Invalid Schema -> Log & Drop.
+	// DO NOT return error, otherwise framework will retry forever.
+	if err := json.Unmarshal(payload, &event); err != nil {
+		c.logger.Error("FATAL: Malformed JSON. Dropping message.", "error", err)
+		return nil 
+	}
+	if err := event.Validate(); err != nil {
+		c.logger.Error("FATAL: Invalid event schema. Dropping message.", "error", err)
+		return nil
+	}
+
+	c.logger.Info("Processing event", "id", event.ID)
+
+	// Business Logic
+	// If svc.Process returns error (e.g., DB down), we return it.
+	// The helix-fnd framework will handle the backoff/retry loop.
+	if err := c.svc.Process(ctx, event); err != nil {
+		// Optional: Filter explicitly known "Business Logic Errors" that shouldn't retry
+		// if errors.Is(err, service.ErrInvalidBalance) { return nil }
+
+		return err
+	}
+
+	return nil
+}

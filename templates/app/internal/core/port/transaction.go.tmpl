@@ -1,0 +1,10 @@
+package port
+
+import "context"
+
+// TxManager defines the interface for managing database transactions.
+// It allows the service layer to execute atomic operations without leaking DB details.
+type TxManager interface {
+	// RunInTx executes the given function within a transaction.
+	RunInTx(ctx context.Context, fn func(ctx context.Context) error) error
+}

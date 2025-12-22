@@ -1,0 +1,32 @@
+package repository
+
+import (
+	"context"
+	"log/slog"
+
+	"github.com/google/uuid"
+
+	"{{ .GoModuleName }}/ent"
+	"{{ .GoModuleName }}/internal/core/entity"
+	"{{ .GoModuleName }}/internal/core/port"
+)
+
+type ProductRepository struct {
+	client *ent.Client
+	logger *slog.Logger
+}
+
+func NewProductRepository(client *ent.Client) port.ProductRepository {
+	return &ProductRepository{
+		client: client,
+		logger: slog.Default(),
+	}
+}
+
+func (r *ProductRepository) Save(ctx context.Context, p *entity.Product) error {
+	return nil
+}
+
+func (r *ProductRepository) FindByID(ctx context.Context, id uuid.UUID) (*entity.Product, error) {
+	return nil, nil
+}

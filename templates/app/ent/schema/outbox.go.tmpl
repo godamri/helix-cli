@@ -1,0 +1,60 @@
+package schema
+
+import (
+	"time"
+
+	"entgo.io/ent"
+	"entgo.io/ent/schema/field"
+	"entgo.io/ent/schema/index"
+	"github.com/google/uuid"
+)
+
+// Outbox holds the schema definition for the Outbox entity.
+type Outbox struct {
+	ent.Schema
+}
+
+// Fields of the Outbox.
+func (Outbox) Fields() []ent.Field {
+	return []ent.Field{
+		field.UUID("id", uuid.UUID{}).
+			Default(uuid.New),
+		field.String("topic").
+			NotEmpty(),
+		field.Bytes("payload").
+			NotEmpty(),
+		
+		field.Enum("status").
+			Values("PENDING", "PROCESSING", "PROCESSED", "FAILED").
+			Default("PENDING").
+			Comment("Status of the event processing"),
+		
+		field.Int("retry_count").
+			Default(0),
+		field.Time("next_retry").
+			Default(time.Now),
+		field.String("last_error").
+			Optional().
+			Nillable(),
+
+		field.Time("created_at").
+			Default(time.Now).
+			Immutable(),
+		
+		field.Time("updated_at").
+			Default(time.Now).
+			UpdateDefault(time.Now),
+
+		field.Time("processed_at").
+			Optional().
+			Nillable(),
+	}
+}
+
+// Indexes for performance.
+func (Outbox) Indexes() []ent.Index {
+	return []ent.Index{
+		index.Fields("status", "next_retry"),
+		index.Fields("status", "updated_at"),
+	}
+}

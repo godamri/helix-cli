@@ -1,0 +1,252 @@
+package v1
+
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
+	
+	"github.com/godamri/helix-fnd/http/response"
+	dto "{{ .GoModuleName }}/internal/core/dto/v1"
+	"{{ .GoModuleName }}/internal/core/port"
+)
+
+type {{ .EntityName }}Handler struct {
+	svc      port.{{ .EntityName }}Service
+	validate *validator.Validate
+}
+
+func New{{ .EntityName }}Handler(svc port.{{ .EntityName }}Service) *{{ .EntityName }}Handler {
+	return &{{ .EntityName }}Handler{
+		svc:      svc,
+		validate: InitValidator(),
+	}
+}
+
+// Create creates a new {{ .EntityName }}.
+// @Summary      Create a single {{ .EntityName }}
+// @Description  Creates a new resource with the provided payload.
+// @Tags         {{ .EntityNameCamel }}s
+// @Accept       json
+// @Produce      json
+// @Param        request body dto.Create{{ .EntityName }}Request true "Payload"
+// @Success      201  {object}  dto.{{ .EntityName }}Response
+// @Failure      400  {object}  dto.ErrorResponse "Validation Error"
+// @Failure      500  {object}  dto.ErrorResponse "Internal Server Error"
+// @Router       /v1/{{ .EntityNameCamel }}s [post]
+func (h *{{ .EntityName }}Handler) Create(w http.ResponseWriter, r *http.Request) {
+	var req dto.Create{{ .EntityName }}Request
+	if !h.decode(w, r, &req) { return }
+	
+	res, err := h.svc.Create(r.Context(), req)
+	if err != nil { h.error(w, r, err); return }
+	
+	response.JSON(w, r, http.StatusCreated, res)
+}
+
+// GetByID retrieves a single {{ .EntityName }}.
+// @Summary      Get {{ .EntityName }} by ID
+// @Description  Returns detailed information of a specific resource.
+// @Tags         {{ .EntityNameCamel }}s
+// @Accept       json
+// @Produce      json
+// @Param        id   path      string  true  "UUID format"
+// @Success      200  {object}  dto.{{ .EntityName }}Response
+// @Failure      400  {object}  dto.ErrorResponse "Invalid ID format"
+// @Failure      404  {object}  dto.ErrorResponse "Resource not found"
+// @Failure      500  {object}  dto.ErrorResponse "Internal Server Error"
+// @Router       /v1/{{ .EntityNameCamel }}s/{id} [get]
+func (h *{{ .EntityName }}Handler) GetByID(w http.ResponseWriter, r *http.Request) {
+	id, ok := h.parseUUID(w, r, chi.URLParam(r, "id"))
+	if !ok { return }
+
+	res, err := h.svc.GetByID(r.Context(), id)
+	if err != nil { h.error(w, r, err); return }
+	
+	response.JSON(w, r, http.StatusOK, res)
+}
+
+// Update modifies an existing {{ .EntityName }}.
+// @Summary      Update {{ .EntityName }}
+// @Description  Full or partial update of a resource.
+// @Tags         {{ .EntityNameCamel }}s
+// @Accept       json
+// @Produce      json
+// @Param        id      path      string  true  "UUID format"
+// @Param        request body      dto.Update{{ .EntityName }}Request true "Payload"
+// @Success      200     {object}  dto.{{ .EntityName }}Response
+// @Failure      400     {object}  dto.ErrorResponse "Validation Error"
+// @Failure      404     {object}  dto.ErrorResponse "Resource not found"
+// @Failure      500     {object}  dto.ErrorResponse "Internal Server Error"
+// @Router       /v1/{{ .EntityNameCamel }}s/{id} [put]
+func (h *{{ .EntityName }}Handler) Update(w http.ResponseWriter, r *http.Request) {
+	var req dto.Update{{ .EntityName }}Request
+	if !h.decode(w, r, &req) { return }
+	req.ID = chi.URLParam(r, "id")
+
+	res, err := h.svc.Update(r.Context(), req)
+	if err != nil { h.error(w, r, err); return }
+
+	response.JSON(w, r, http.StatusOK, res)
+}
+
+// Delete removes a {{ .EntityName }}.
+// @Summary      Delete {{ .EntityName }}
+// @Description  Soft-deletes the resource. Idempotent.
+// @Tags         {{ .EntityNameCamel }}s
+// @Accept       json
+// @Produce      json
+// @Param        id   path      string  true  "UUID format"
+// @Success      204  "No Content"
+// @Failure      400  {object}  dto.ErrorResponse "Invalid ID format"
+// @Failure      500  {object}  dto.ErrorResponse "Internal Server Error"
+// @Router       /v1/{{ .EntityNameCamel }}s/{id} [delete]
+func (h *{{ .EntityName }}Handler) Delete(w http.ResponseWriter, r *http.Request) {
+	id, ok := h.parseUUID(w, r, chi.URLParam(r, "id"))
+	if !ok { return }
+
+	if err := h.svc.Delete(r.Context(), id); err != nil { h.error(w, r, err); return }
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// List retrieves a paginated list of {{ .EntityName }}s.
+// @Summary      List and Filter {{ .EntityName }}s
+// @Description  Advanced query capabilities with pagination, sorting, and filtering.
+// @Tags         {{ .EntityNameCamel }}s
+// @Accept       json
+// @Produce      json
+// @Param        page        query     int     false  "Page number (default: 1)"           default(1)
+// @Param        page_size   query     int     false  "Items per page (default: 10, max: 100)" default(10)
+// @Param        search      query     string  false  "Fuzzy search on name"
+// @Param        is_active   query     boolean false  "Filter by status"
+// @Param        sort_by     query     string  false  "Sort field"       Enums(created_at, name) default(created_at)
+// @Param        sort_order  query     string  false  "Sort direction"   Enums(asc, desc)        default(desc)
+// @Success      200         {object}  dto.List{{ .EntityName }}Response
+// @Failure      400         {object}  dto.ErrorResponse "Invalid Query Params"
+// @Failure      500         {object}  dto.ErrorResponse "Internal Server Error"
+// @Router       /v1/{{ .EntityNameCamel }}s [get]
+func (h *{{ .EntityName }}Handler) List(w http.ResponseWriter, r *http.Request) {
+	page := h.queryInt(r, "page", 1)
+	pageSize := h.queryInt(r, "page_size", 10)
+	
+	var isActive *bool
+	if val := r.URL.Query().Get("is_active"); val != "" {
+		b, _ := strconv.ParseBool(val)
+		isActive = &b
+	}
+
+	req := dto.List{{ .EntityName }}Request{
+		Page:      page,
+		PageSize:  pageSize,
+		Search:    r.URL.Query().Get("search"),
+		IsActive:  isActive,
+		SortBy:    r.URL.Query().Get("sort_by"),
+		SortOrder: r.URL.Query().Get("sort_order"),
+	}
+
+	// Validate logic inside DTO is enough? 
+	// The handler helper 'decode' is only for body. 
+	// For query params, we must call validate manually.
+	if err := h.validate.Struct(req); err != nil {
+		RespondWithValidationErrors(w, r, err)
+		return
+	}
+
+	res, err := h.svc.List(r.Context(), req)
+	if err != nil { h.error(w, r, err); return }
+
+	response.JSON(w, r, http.StatusOK, res)
+}
+
+// BulkCreate creates multiple {{ .EntityName }}s in a transaction.
+// @Summary      Bulk Create {{ .EntityName }}s
+// @Description  Transactional creation of multiple items.
+// @Tags         {{ .EntityNameCamel }}s
+// @Accept       json
+// @Produce      json
+// @Param        request body dto.BulkCreate{{ .EntityName }}Request true "Batch Payload"
+// @Success      201  {object}  dto.BulkCreate{{ .EntityName }}Response
+// @Failure      400  {object}  dto.ErrorResponse "Validation Error"
+// @Failure      500  {object}  dto.ErrorResponse "Internal Server Error"
+// @Router       /v1/{{ .EntityNameCamel }}s/bulk [post]
+func (h *{{ .EntityName }}Handler) BulkCreate(w http.ResponseWriter, r *http.Request) {
+	var req dto.BulkCreate{{ .EntityName }}Request
+	if !h.decode(w, r, &req) { return }
+
+	res, err := h.svc.BulkCreate(r.Context(), req)
+	if err != nil { h.error(w, r, err); return }
+
+	response.JSON(w, r, http.StatusCreated, res)
+}
+
+// BulkDelete removes multiple {{ .EntityName }}s.
+// @Summary      Bulk Delete {{ .EntityName }}s
+// @Description  Soft-deletes multiple items by ID.
+// @Tags         {{ .EntityNameCamel }}s
+// @Accept       json
+// @Produce      json
+// @Param        ids  query     string  true  "Comma-separated UUIDs (e.g. uuid1,uuid2)"
+// @Success      204  "No Content"
+// @Failure      400  {object}  dto.ErrorResponse "Invalid IDs"
+// @Failure      500  {object}  dto.ErrorResponse "Internal Server Error"
+// @Router       /v1/{{ .EntityNameCamel }}s/bulk [delete]
+func (h *{{ .EntityName }}Handler) BulkDelete(w http.ResponseWriter, r *http.Request) {
+	idsStr := r.URL.Query().Get("ids")
+	if idsStr == "" {
+		response.ErrorJSON(w, r, http.StatusBadRequest, "ERR_BAD_REQUEST", "ids query param required")
+		return
+	}
+	
+	var uuids []uuid.UUID
+	for _, id := range strings.Split(idsStr, ",") {
+		if u, err := uuid.Parse(strings.TrimSpace(id)); err == nil { uuids = append(uuids, u) }
+	}
+	
+	if len(uuids) == 0 {
+		response.ErrorJSON(w, r, http.StatusBadRequest, "ERR_BAD_REQUEST", "no valid ids provided")
+		return
+	}
+
+	if err := h.svc.BulkDelete(r.Context(), uuids); err != nil { h.error(w, r, err); return }
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- HELPERS ---
+
+func (h *{{ .EntityName }}Handler) decode(w http.ResponseWriter, r *http.Request, v interface{}) bool {
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		response.ErrorJSON(w, r, http.StatusBadRequest, "ERR_BAD_REQUEST", "Invalid JSON")
+		return false
+	}
+	if err := h.validate.Struct(v); err != nil {
+		RespondWithValidationErrors(w, r, err)
+		return false
+	}
+	return true
+}
+
+func (h *{{ .EntityName }}Handler) parseUUID(w http.ResponseWriter, r *http.Request, s string) (uuid.UUID, bool) {
+	id, err := uuid.Parse(s)
+	if err != nil {
+		response.ErrorJSON(w, r, http.StatusBadRequest, "ERR_INVALID_ID", "ID must be a valid UUID")
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
+func (h *{{ .EntityName }}Handler) queryInt(r *http.Request, key string, def int) int {
+	val := r.URL.Query().Get(key)
+	if val == "" { return def }
+	i, err := strconv.Atoi(val)
+	if err != nil { return def }
+	return i
+}
+
+func (h *{{ .EntityName }}Handler) error(w http.ResponseWriter, r *http.Request, err error) {
+	// Centralized error mapping logic
+	response.ErrorJSON(w, r, http.StatusInternalServerError, "ERR_INTERNAL", err.Error())
+}

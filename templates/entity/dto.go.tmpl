@@ -1,0 +1,118 @@
+package dto
+
+import (
+	"time"
+)
+
+// --- SHARED META ---
+
+// MetaResponse standardizes pagination metadata.
+type MetaResponse struct {
+	CurrentPage int `json:"current_page" example:"1"`
+	PageSize    int `json:"page_size" example:"10"`
+	TotalItems  int `json:"total_items" example:"150"`
+	TotalPages  int `json:"total_pages" example:"15"`
+}
+
+// ErrorResponse defines the standard error shape for Swagger.
+type ErrorResponse struct {
+	Error   ErrorDetail `json:"error"`
+	Meta    ErrorMeta   `json:"meta"`
+}
+
+type ErrorDetail struct {
+	Code    string `json:"code" example:"ERR_INVALID_INPUT"`
+	Message string `json:"message" example:"Validation failed"`
+}
+
+type ErrorMeta struct {
+	TraceID string `json:"trace_id" example:"a1b2c3d4"`
+}
+
+// --- ENTITY RESPONSE ---
+
+type {{ .EntityName }}Response struct {
+	ID        string     `json:"id" example:"550e8400-e29b-41d4-a716-446655440000"`
+	Name      string     `json:"name" example:"Premium Plan"`
+	IsActive  bool       `json:"is_active" example:"true"`
+	CreatedAt time.Time  `json:"created_at" example:"2024-01-01T12:00:00Z"`
+	UpdatedAt time.Time  `json:"updated_at" example:"2024-01-02T15:30:00Z"`
+	DeletedAt *time.Time `json:"deleted_at,omitempty" example:"null"` // Soft Delete visibility
+}
+
+// --- CREATE ---
+
+type Create{{ .EntityName }}Request struct {
+	Name string `json:"name" validate:"required,min=3,max=100" example:"Premium Plan"`
+}
+
+type BulkCreate{{ .EntityName }}Request struct {
+	Items []Create{{ .EntityName }}Request `json:"items" validate:"required,min=1,max=100,dive"`
+}
+
+type BulkCreate{{ .EntityName }}Response struct {
+	SuccessCount int      `json:"success_count" example:"5"`
+	IDs          []string `json:"ids" example:"550e8400-e29b-41d4-a716-446655440000,550e8400-e29b-41d4-a716-446655440001"`
+}
+
+// --- UPDATE ---
+
+type Update{{ .EntityName }}Request struct {
+	ID       string `json:"-" swaggerignore:"true"` // ID di-inject dari URL, abaikan di Swagger body
+	Name     string `json:"name" validate:"omitempty,min=3,max=100" example:"Super Premium Plan"`
+	IsActive *bool  `json:"is_active" validate:"omitempty" example:"false"`
+}
+
+type BulkUpdate{{ .EntityName }}Request struct {
+	IDs      []string `json:"ids" validate:"required,min=1,max=100" example:"550e8400-e29b-41d4-a716-446655440000"`
+	IsActive *bool    `json:"is_active" validate:"required" example:"false"`
+}
+
+type BulkUpdate{{ .EntityName }}Response struct {
+	MatchedCount int `json:"matched_count" example:"10"`
+	UpdatedCount int `json:"updated_count" example:"10"`
+}
+
+// --- QUERY / LIST ---
+
+// List{{ .EntityName }}Request defines filters for listing.
+type List{{ .EntityName }}Request struct {
+	// Pagination
+	Page     int `json:"page" validate:"min=1" example:"1"`
+	PageSize int `json:"page_size" validate:"min=1,max=100" example:"10"`
+
+	// Search
+	Search string `json:"search" validate:"omitempty,max=50" example:"premium"`
+
+	// Filters
+	IsActive *bool    `json:"is_active" example:"true"`
+	IDs      []string `json:"ids" example:"uuid1,uuid2"`
+
+	// Sorting
+	SortBy    string `json:"sort_by" validate:"omitempty,oneof=created_at name" example:"created_at" enums:"created_at,name"`
+	SortOrder string `json:"sort_order" validate:"omitempty,oneof=asc desc" example:"desc" enums:"asc,desc"`
+	
+	IncludeDeleted bool `json:"include_deleted" example:"false"`
+}
+
+type List{{ .EntityName }}Response struct {
+	Data []{{ .EntityName }}Response `json:"data"`
+	Meta MetaResponse                `json:"meta"`
+}
+
+// CursorPaginationRequest untuk model infinity scroll atau next-page
+type CursorPaginationRequest struct {
+	// LastID adalah ID terakhir dari page sebelumnya (Cursor)
+	LastID string `json:"last_id" query:"last_id"`
+	// Limit jumlah data per request
+	Limit int `json:"limit" validate:"required,min=1,max=100" default:"10"`
+	// Search fuzzy search (optional)
+	Search string `json:"search" validate:"omitempty,max=50"`
+}
+
+// CursorPaginationResponse membungkus data dan tanda buat page selanjutnya
+type CursorPaginationResponse struct {
+	Data       interface{} `json:"data"`
+	NextCursor string      `json:"next_cursor" example:"uuid-id-terakhir"`
+	HasNext    bool        `json:"has_next"`
+}

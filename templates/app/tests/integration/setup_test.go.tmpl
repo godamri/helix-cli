@@ -1,0 +1,83 @@
+package integration
+
+import (
+	"context"
+	"database/sql"
+	"log"
+	"testing"
+	"time"
+
+	"entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
+	"github.com/stretchr/testify/suite"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
+	"{{ .GoModuleName }}/ent"
+)
+
+type IntegrationTestSuite struct {
+	suite.Suite
+	ctx         context.Context
+	pgContainer *postgres.PostgresContainer
+	EntClient   *ent.Client
+	DB          *sql.DB
+}
+
+func (s *IntegrationTestSuite) SetupSuite() {
+	s.ctx = context.Background()
+
+	var err error
+	s.pgContainer, err = postgres.Run(s.ctx,
+		"postgres:16-alpine",
+		postgres.WithDatabase("testdb"),
+		postgres.WithUsername("testuser"),
+		postgres.WithPassword("testpass"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(10*time.Second)),
+	)
+	if err != nil {
+		log.Fatalf("failed to start container: %s", err)
+	}
+
+	connStr, err := s.pgContainer.ConnectionString(s.ctx, "sslmode=disable")
+	if err != nil {
+		log.Fatalf("failed to get connection string: %s", err)
+	}
+
+	s.DB, err = sql.Open("postgres", connStr)
+	if err != nil {
+		log.Fatalf("failed to open db connection: %s", err)
+	}
+
+	drv := entsql.OpenDB(dialect.Postgres, s.DB)
+	s.EntClient = ent.NewClient(ent.Driver(drv))
+
+	if err := s.EntClient.Schema.Create(s.ctx); err != nil {
+		log.Fatalf("failed to create schema: %s", err)
+	}
+}
+
+func (s *IntegrationTestSuite) TearDownSuite() {
+	if s.EntClient != nil {
+		s.EntClient.Close()
+	}
+	if s.pgContainer != nil {
+		if err := s.pgContainer.Terminate(s.ctx); err != nil {
+			log.Printf("failed to terminate container: %s", err)
+		}
+	}
+}
+
+func (s *IntegrationTestSuite) TestDatabaseConnection() {
+	s.NotNil(s.EntClient)
+}
+
+func TestIntegrationSuite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	suite.Run(t, new(IntegrationTestSuite))
+}

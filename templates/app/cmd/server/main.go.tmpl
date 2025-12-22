@@ -1,0 +1,328 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"log/slog"
+	"os"
+	"time" // Used for time.Parse now
+
+	"github.com/go-chi/chi/v5"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/godamri/helix-fnd/app"
+	"github.com/godamri/helix-fnd/audit"
+	"github.com/godamri/helix-fnd/cache"
+	"github.com/godamri/helix-fnd/crypto"
+	"github.com/godamri/helix-fnd/database"
+	"github.com/godamri/helix-fnd/log"
+	"github.com/godamri/helix-fnd/messaging"
+	"github.com/godamri/helix-fnd/server"
+	"github.com/godamri/helix-fnd/server/health"
+	fndMiddleware "github.com/godamri/helix-fnd/server/middleware"
+
+	pb "{{ .GoModuleName }}/api/proto/v1"
+
+	{{- if eq .Driver "ent" }}
+	"{{ .GoModuleName }}/ent"
+	"entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
+	{{- end }}
+
+	handlerV1 "{{ .GoModuleName }}/internal/adapter/handler/v1"
+	"{{ .GoModuleName }}/internal/adapter/repository"
+	"{{ .GoModuleName }}/internal/adapter/worker"
+	"{{ .GoModuleName }}/internal/core/service"
+	localConfig "{{ .GoModuleName }}/internal/pkg/config"
+	customMiddleware "{{ .GoModuleName }}/internal/pkg/middleware"
+
+	_ "{{ .GoModuleName }}/docs"
+	httpSwagger "github.com/swaggo/http-swagger"
+)
+
+type DebugLogProducer struct {
+	logger *slog.Logger
+}
+
+func (p *DebugLogProducer) Publish(ctx context.Context, topic string, key string, payload []byte) error {
+	p.logger.Info("stub_producer: publishing event (dry-run)", "topic", topic, "key", key, "size", len(payload))
+	return nil
+}
+
+// @title           {{ .ProjectName }} API
+// @version         1.1
+// @description     Enterprise Microservice API - {{ if eq .Driver "ent" }}Ent ORM{{ else }}Raw SQL{{ end }} Edition.
+func main() {
+	logger := log.New(log.Config{Level: "info", Format: "json"})
+	slog.SetDefault(logger)
+
+	if err := localConfig.Load(); err != nil {
+		logger.Error("Failed to load config", "error", err)
+		os.Exit(1)
+	}
+	cfg := localConfig.Get()
+
+	logger = log.New(log.Config{Level: cfg.LogFormat, Format: cfg.LogFormat})
+	slog.SetDefault(logger)
+
+	runner := app.NewRunner(logger)
+	runner.Run(func(ctx context.Context) error {
+		return run(ctx, logger)
+	})
+}
+
+func run(ctx context.Context, logger *slog.Logger) error {
+	cfg := localConfig.Get()
+
+	logger.Info("Starting {{ .ProjectName }}", "env", cfg.Environment, "infra", "immutable", "driver", "{{ .Driver }}")
+
+	// -------------------------------------------------------------------------
+	// AUDIT LOGGER SETUP (Async / Kafka)
+	// -------------------------------------------------------------------------
+	var auditLogger audit.Logger
+	var err error
+
+	if len(cfg.KafkaBrokers) > 0 && cfg.Audit.Output == "kafka" {
+		logger.Info("Initializing Audit Logger (Kafka Async)...")
+		auditLogger, err = audit.NewKafkaLogger(cfg.KafkaBrokers, cfg.Audit.Topic)
+		if err != nil {
+			return fmt.Errorf("failed to init audit kafka logger: %w", err)
+		}
+		if closer, ok := auditLogger.(interface{ Close() error }); ok {
+			defer closer.Close()
+		}
+	} else {
+		logger.Info("Initializing Audit Logger (Console Async)...")
+		al := audit.NewAsyncLogger(os.Stdout, cfg.Audit.BufferSize, logger)
+		defer al.Close()
+		auditLogger = al
+	}
+
+	tp, err := initTracer(cfg.ServiceName, cfg.Environment)
+	if err != nil {
+		logger.Error("failed to init tracer", "error", err)
+	} else {
+		defer tp.Shutdown(context.Background())
+	}
+
+	// MAIN DB CONNECTION
+	stdMainDB, err := database.NewPostgres(ctx, database.Config{
+		DSN: cfg.DBDSN, MaxOpenConns: cfg.DBMaxOpenConns, MaxIdleConns: cfg.DBMaxIdleConns,
+	}, "pgx", cfg.ServiceName)
+	if err != nil {
+		return fmt.Errorf("main db init failed: %w", err)
+	}
+	defer stdMainDB.Close()
+
+	// WORKER DB CONNECTION (Bulkhead Pattern)
+	var stdWorkerDB *sql.DB
+	if cfg.WorkerDBDSN != "" && cfg.WorkerDBDSN != cfg.DBDSN {
+		logger.Info("Connecting to Worker Database (Isolated Pool)...")
+		stdWorkerDB, err = database.NewPostgres(ctx, database.Config{
+			DSN: cfg.WorkerDBDSN, MaxOpenConns: cfg.WorkerDBMaxOpenConns, MaxIdleConns: cfg.WorkerDBMaxIdleConns, ConnMaxLifetime: cfg.WorkerDBConnMaxLifetime,
+		}, "pgx", cfg.ServiceName+"-worker")
+		if err != nil {
+			return fmt.Errorf("worker db init failed: %w", err)
+		}
+		defer stdWorkerDB.Close()
+	} else {
+		stdWorkerDB = stdMainDB
+	}
+
+	{{- if eq .Driver "ent" }}
+	// ENT CLIENT INIT (Reuse OTel-instrumented DB)
+	drv := entsql.OpenDB(dialect.Postgres, stdMainDB)
+	entClient := ent.NewClient(ent.Driver(drv))
+	{{- end }}
+
+	// Redis
+	var rdb *redis.Client
+	if cfg.RedisAddr != "" {
+		rdb, err = cache.NewRedis(ctx, cache.Config{Addr: cfg.RedisAddr, Password: cfg.RedisPassword, DB: cfg.RedisDB})
+		if err != nil {
+			return fmt.Errorf("redis init failed: %w", err)
+		}
+		defer rdb.Close()
+	}
+
+	// Auth
+	var authMiddleware *fndMiddleware.AuthMiddleware
+	if cfg.AuthEnabled {
+		jwksClient, err := crypto.NewJWKSCachingClient(
+			cfg.AuthJWKSURL, 
+			cfg.AuthIssuer, 
+			cfg.JWKSRefreshInterval, 
+			cfg.AuthJWKSMaxStale, // Configurable Stale Tolerance
+			logger,
+		)
+		if err != nil {
+			return fmt.Errorf("auth init failed: %w", err)
+		}
+		strategy := fndMiddleware.NewJWTStrategy(jwksClient, logger)
+		authMiddleware = fndMiddleware.NewAuthMiddleware(strategy)
+	}
+
+	// Messaging (BUSINESS EVENTS - SyncProducer)
+	var producer worker.EventProducer
+	if len(cfg.KafkaBrokers) > 0 {
+		kafkaProducer, err := messaging.NewProducer(messaging.Config{Brokers: cfg.KafkaBrokers}, logger)
+		if err != nil {
+			return fmt.Errorf("kafka init failed: %w", err)
+		}
+		defer kafkaProducer.Close()
+		producer = kafkaProducer
+	} else {
+		producer = &DebugLogProducer{logger: logger}
+	}
+
+	// WIRING
+	{{- if eq .Driver "ent" }}
+	repo := repository.New{{ .EntityName }}Repository(entClient)
+	txManager := repository.NewEntTxManager(entClient)
+	{{- else }}
+	repo := repository.New{{ .EntityName }}Repository(stdMainDB)
+	txManager := repository.NewSQLTxManager(stdMainDB)
+	{{- end }}
+	
+	outboxRepo := repository.NewOutboxRepository(stdMainDB)
+	
+	svc := service.New{{ .EntityName }}Service(repo, outboxRepo, txManager)
+
+	healthChecker := health.NewChecker(stdMainDB, logger)
+
+	g, groupCtx := errgroup.WithContext(ctx)
+
+	// --- HTTP/GRPC SERVER ---
+	if cfg.AppMode == "all" || cfg.AppMode == "api" {
+		var r *chi.Mux
+		var grpcSrv *grpc.Server
+
+		if cfg.EnableHTTP {
+			httpHandler := handlerV1.New{{ .EntityName }}Handler(svc)
+			r = chi.NewRouter()
+			r.Use(fndMiddleware.SecurityHeaders)
+			r.Use(fndMiddleware.TraceIDMiddleware)
+			r.Use(fndMiddleware.MetricsMiddleware)
+			r.Use(fndMiddleware.LoggerMiddleware)
+			r.Use(fndMiddleware.PanicRecovery)
+
+			if authMiddleware != nil {
+				r.Use(authMiddleware.HTTPMiddleware)
+			}
+			
+			// If missing, ensure helix-fnd/audit/audit.go exists with Config struct.
+			r.Use(fndMiddleware.AuditMiddleware(auditLogger, audit.Config{
+				MaskFields: cfg.Audit.MaskFields,
+			}))
+
+			if rdb != nil {
+				r.Use(fndMiddleware.RateLimitMiddleware(rdb, cfg.RateLimitGlobalRate, cfg.RateLimitGlobalBurst, cfg.RateLimitGlobalPeriod))
+				
+				// Idempotency: FailOpen=true (Availability over Consistency for Redis failures)
+				r.Use(fndMiddleware.IdempotencyMiddleware(fndMiddleware.IdempotencyConfig{
+					HeaderKey: "Idempotency-Key", 
+					Expiry: cfg.IdempotencyExpiry, 
+					RedisClient: rdb, 
+					Logger: logger,
+					FailOpen: true, 
+				}))
+			}
+
+			r.Handle("/metrics", promhttp.Handler())
+			healthChecker.RegisterRoutes(r)
+
+			if cfg.DocsEnabled {
+				r.Get("/swagger/*", httpSwagger.Handler(httpSwagger.URL("/swagger/doc.json")))
+			}
+
+			r.Route("/v1", func(r chi.Router) {
+				if cfg.DeprecationActive {
+					sunsetTime, err := time.Parse("2006-01-02", cfg.DeprecationSunset)
+					if err != nil {
+						logger.Warn("Invalid deprecation sunset date format, disabling deprecation middleware", "date", cfg.DeprecationSunset, "error", err)
+					} else {
+						r.Use(customMiddleware.DeprecationMiddleware(customMiddleware.DeprecationConfig{
+							Active: true, SunsetDate: sunsetTime, MigrationLink: cfg.DeprecationLink,
+						}))
+					}
+				}
+				r.Route("/{{ .EntityNameCamel }}s", func(r chi.Router) {
+					r.Post("/", httpHandler.Create)
+					r.Get("/{id}", httpHandler.GetByID)
+					r.Put("/{id}", httpHandler.Update)
+					r.Delete("/{id}", httpHandler.Delete)
+					r.Get("/", httpHandler.List)
+					r.Post("/bulk", httpHandler.BulkCreate)
+					r.Delete("/bulk", httpHandler.BulkDelete)
+				})
+			})
+		}
+
+		if cfg.EnableGRPC {
+			grpcHandler := handlerV1.New{{ .EntityName }}GrpcHandler(svc)
+			opts := []grpc.ServerOption{grpc.UnaryInterceptor(fndMiddleware.GRPCRecoveryInterceptor)}
+			if authMiddleware != nil {
+				opts = append(opts, grpc.UnaryInterceptor(authMiddleware.GRPCUnaryInterceptor))
+			}
+			grpcSrv = grpc.NewServer(opts...)
+			pb.Register{{ .EntityName }}ServiceServer(grpcSrv, grpcHandler)
+			reflection.Register(grpcSrv)
+		}
+
+		srv := server.New(server.Config{
+			EnableHTTP: cfg.EnableHTTP, EnableGRPC: cfg.EnableGRPC,
+			HTTPPort: fmt.Sprintf("%d", cfg.AppPort), GRPCPort: fmt.Sprintf("%d", cfg.GRPCPort),
+			HTTPReadTimeout: cfg.HTTPReadTimeout, HTTPWriteTimeout: cfg.HTTPWriteTimeout,
+			ShutdownTimeout: cfg.ShutdownTimeout,
+			MTLSEnabled: cfg.MTLSEnabled, MTLSCACert: cfg.MTLSCACert,
+			MTLSServerCert: cfg.MTLSServerCert, MTLSServerKey: cfg.MTLSServerKey,
+		}, logger, r, grpcSrv)
+
+		g.Go(func() error { return srv.Start(groupCtx) })
+	}
+
+	// --- WORKER ---
+	if cfg.AppMode == "all" || cfg.AppMode == "worker" {
+		consumerMgr := messaging.NewConsumerManager(logger)
+		outboxWorker := worker.NewOutboxWorker(stdWorkerDB, producer)
+
+		g.Go(func() error {
+			consumerMgr.Start(groupCtx)
+			<-groupCtx.Done()
+			return consumerMgr.Close()
+		})
+		g.Go(func() error {
+			outboxWorker.Start(groupCtx)
+			return nil
+		})
+	}
+
+	return g.Wait()
+}
+
+func initTracer(name, env string) (*sdktrace.TracerProvider, error) {
+    res, err := resource.New(context.Background(), resource.WithAttributes(
+        attribute.String("service.name", name),
+        attribute.String("deployment.environment", env),
+    ))
+    if err != nil {
+        return nil, err
+    }
+    tp := sdktrace.NewTracerProvider(sdktrace.WithResource(res), sdktrace.WithSampler(sdktrace.AlwaysSample()))
+    otel.SetTracerProvider(tp)
+    otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+    return tp, nil
+}

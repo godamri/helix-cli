@@ -1,0 +1,19 @@
+package port
+
+import (
+	"context"
+)
+
+type OutboxEvent struct {
+	Topic   string
+	Key     string // Usually Aggregate ID
+	Payload []byte
+	TraceID string
+	SpanID  string
+}
+
+type OutboxRepository interface {
+	// Create saves an event to the outbox table.
+	// It MUST be called within a transaction context.
+	Create(ctx context.Context, event OutboxEvent) error
+}

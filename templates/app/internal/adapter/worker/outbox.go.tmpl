@@ -1,0 +1,285 @@
+package worker
+
+import (
+	"context"
+	"database/sql"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
+
+	"{{ .GoModuleName }}/internal/pkg/config"
+)
+
+// EventProducer interface aligns with our SyncProducer.
+type EventProducer interface {
+	Publish(ctx context.Context, topic string, key string, payload []byte) error
+}
+
+// OutboxRow represents the data from the outboxes table.
+type OutboxRow struct {
+	ID         uuid.UUID
+	Topic      string
+	Payload    []byte
+	RetryCount int
+}
+
+type retryUpdate struct {
+	id      uuid.UUID
+	backoff time.Duration
+	err     string
+	count   int
+}
+
+type OutboxWorker struct {
+	db       *sql.DB
+	producer EventProducer
+	logger   *slog.Logger
+	sem      *semaphore.Weighted // Backpressure management
+}
+
+func NewOutboxWorker(db *sql.DB, producer EventProducer) *OutboxWorker {
+	cfg := config.Get()
+	concurrency := cfg.WorkerConcurrency
+	if concurrency <= 0 {
+		concurrency = 10
+	}
+
+	return &OutboxWorker{
+		db:       db,
+		producer: producer,
+		logger:   slog.Default().With("component", "sql_outbox_worker"),
+		sem:      semaphore.NewWeighted(int64(concurrency)),
+	}
+}
+
+func (w *OutboxWorker) Start(ctx context.Context) {
+	cfg := config.Get()
+	w.logger.Info("SQL Outbox worker started",
+		"mode", "high_performance_sql",
+		"concurrency", cfg.WorkerConcurrency,
+		"batch_size", cfg.WorkerBatchSize,
+		"rescue_enabled", cfg.WorkerEnableRescue, // Log status
+	)
+
+	// Only run this if explicitly enabled (Leader/Janitor/Dev Mode).
+	if cfg.WorkerEnableRescue {
+		go w.runRescueLoop(ctx)
+	}
+
+	ticker := time.NewTicker(cfg.WorkerPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			w.logger.Info("Outbox worker stopping gracefully...")
+			return
+		case <-ticker.C:
+			// Drain logic: clear backlog quickly if traffic spikes
+			for i := 0; i < 5; i++ {
+				processed, err := w.processBatch(ctx)
+				if err != nil {
+					w.logger.Error("Failed to process outbox batch", "error", err)
+					break
+				}
+				if !processed {
+					break
+				}
+			}
+		}
+	}
+}
+
+// runRescueLoop handles the "Zombie Trap". It looks for events stuck in PROCESSING
+// for too long (likely due to a pod crash) and resets them to PENDING.
+func (w *OutboxWorker) runRescueLoop(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	stuckThreshold := 5 * time.Minute
+	batchSize := 1000
+
+	w.logger.Info("Zombie Rescue Loop started (Janitor Mode)")
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-stuckThreshold)
+
+			for {
+				if ctx.Err() != nil {
+					return
+				}
+
+				query := `
+					WITH batch AS (
+						SELECT id FROM outboxes 
+						WHERE status = 'PROCESSING' 
+						  AND updated_at < $1
+						LIMIT $2
+						FOR UPDATE SKIP LOCKED
+					)
+					UPDATE outboxes 
+					SET status = 'PENDING', 
+						next_retry = NOW(), 
+						last_error = 'zombie_rescue: worker crashed',
+						updated_at = NOW()
+					FROM batch
+					WHERE outboxes.id = batch.id`
+
+				res, err := w.db.ExecContext(ctx, query, cutoff, batchSize)
+				if err != nil {
+					w.logger.Error("Rescue loop failed", "error", err)
+					break
+				}
+
+				rows, _ := res.RowsAffected()
+				if rows == 0 {
+					break
+				}
+
+				w.logger.Warn("Rescued zombie outbox events", "count", rows)
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+    }
+}
+
+func (w *OutboxWorker) processBatch(ctx context.Context) (bool, error) {
+	cfg := config.Get()
+	maxRetries := 5
+
+	// CLAIM
+	query := `
+		UPDATE outboxes 
+		SET status = 'PROCESSING', updated_at = NOW()
+		WHERE id IN (
+			SELECT id FROM outboxes 
+			WHERE status = 'PENDING' AND next_retry <= NOW() 
+			ORDER BY created_at ASC 
+			LIMIT $1 
+			FOR UPDATE SKIP LOCKED
+		) 
+		RETURNING id, topic, payload, retry_count`
+
+	rows, err := w.db.QueryContext(ctx, query, cfg.WorkerBatchSize)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	var claimed []OutboxRow
+	for rows.Next() {
+		var row OutboxRow
+		if err := rows.Scan(&row.ID, &row.Topic, &row.Payload, &row.RetryCount); err != nil {
+			return false, err
+		}
+		claimed = append(claimed, row)
+	}
+
+	if len(claimed) == 0 {
+		return false, nil
+	}
+
+	// PUBLISH
+	var mu sync.Mutex
+	successIDs := []uuid.UUID{}
+	retries := []retryUpdate{}
+	failIDs := []uuid.UUID{}
+
+	shards := make(map[string][]OutboxRow)
+	for _, row := range claimed {
+		shards[row.Topic] = append(shards[row.Topic], row)
+    }
+
+	g, grpCtx := errgroup.WithContext(ctx)
+
+	for topic, shardEvents := range shards {
+		topic, shardEvents := topic, shardEvents
+
+		if err := w.sem.Acquire(grpCtx, 1); err != nil {
+			return true, err
+		}
+
+		g.Go(func() error {
+			defer w.sem.Release(1)
+
+			for _, event := range shardEvents {
+				if grpCtx.Err() != nil {
+					return grpCtx.Err()
+				}
+
+				err := w.producer.Publish(grpCtx, event.Topic, event.ID.String(), event.Payload)
+
+				mu.Lock()
+				if err == nil {
+					successIDs = append(successIDs, event.ID)
+				} else {
+					w.logger.Warn("Event publish failed", "id", event.ID, "topic", topic, "error", err)
+
+					if event.RetryCount >= maxRetries {
+						failIDs = append(failIDs, event.ID)
+					} else {
+						backoff := time.Duration(1<<uint(event.RetryCount)) * time.Second
+						retries = append(retries, retryUpdate{
+							id:      event.ID,
+							backoff: backoff,
+							err:     err.Error(),
+							count:   event.RetryCount + 1,
+						})
+					}
+					mu.Unlock()
+					return nil
+				}
+				mu.Unlock()
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	// RESOLVE
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	w.resolveResults(shutdownCtx, successIDs, retries, failIDs)
+
+	return true, nil
+}
+
+func (w *OutboxWorker) resolveResults(ctx context.Context, successIDs []uuid.UUID, retries []retryUpdate, failIDs []uuid.UUID) {
+	now := time.Now()
+
+	if len(successIDs) > 0 {
+		_, err := w.db.ExecContext(ctx, 
+			"UPDATE outboxes SET status = 'PROCESSED', processed_at = $1, updated_at = $1 WHERE id = ANY($2)", 
+			now, successIDs)
+		if err != nil {
+			w.logger.Error("Failed to mark events as PROCESSED", "count", len(successIDs), "error", err)
+		}
+	}
+
+	for _, r := range retries {
+		_, err := w.db.ExecContext(ctx, 
+			"UPDATE outboxes SET status = 'PENDING', retry_count = $1, next_retry = $2, last_error = $3, updated_at = $4 WHERE id = $5",
+			r.count, now.Add(r.backoff), r.err, now, r.id)
+		if err != nil {
+			w.logger.Error("Failed to mark event for RETRY", "id", r.id, "error", err)
+		}
+	}
+
+	if len(failIDs) > 0 {
+		_, err := w.db.ExecContext(ctx, 
+			"UPDATE outboxes SET status = 'FAILED', last_error = 'max_retries_exceeded', processed_at = $1, updated_at = $1 WHERE id = ANY($2)", 
+			now, failIDs)
+		if err != nil {
+			w.logger.Error("Failed to mark events as FAILED", "count", len(failIDs), "error", err)
+		}
+	}
+}

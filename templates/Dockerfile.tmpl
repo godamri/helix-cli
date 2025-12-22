@@ -1,0 +1,77 @@
+# ==============================================================================
+# BUILDER STAGE (Compiling)
+# ==============================================================================
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache git make
+
+# Copy module files first (Layer Caching)
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source
+COPY . .
+
+# Build Binary
+# -ldflags="-s -w" strips debug info for smaller binary
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/server cmd/server/main.go
+
+# ==============================================================================
+# DEVELOPMENT STAGE (Hot Reload & Tooling)
+# ==============================================================================
+FROM golang:1.24-alpine AS dev
+
+WORKDIR /app
+
+# Install Dev Tools:
+# - git, make, curl (Standard)
+# - swag (Docs)
+# - air (Hot Reload)
+# - buf (Protobuf Manager)
+# - protoc-gen-go & protoc-gen-go-grpc (Local Plugins - NO REMOTE CALLS)
+RUN apk add --no-cache git make curl build-base \
+    && go install github.com/swaggo/swag/cmd/swag@v1.16.4 \
+    && go install github.com/air-verse/air@v1.52.3 \
+    && go install github.com/bufbuild/buf/cmd/buf@v1.28.1 \
+    && go install google.golang.org/protobuf/cmd/protoc-gen-go@latest \
+    && go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
+
+# Install Atlas (Migrations)
+RUN curl -sSf https://atlasgo.sh | sh
+
+# Copy dependencies
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source
+COPY . .
+
+# Expose ports
+EXPOSE 8080 9090
+
+# Default to Air for hot reload
+CMD ["air", "-c", ".air.toml"]
+
+# ==============================================================================
+# 3. PRODUCTION STAGE (Minimal Runtime)
+# ==============================================================================
+FROM gcr.io/distroless/static-debian12 AS prod
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /app/server /app/server
+
+# Copy Config (If you use file-based config)
+# COPY config.yaml /app/config.yaml
+
+# Create non-root user (Security Best Practice)
+USER nonroot:nonroot
+
+EXPOSE 8080 9090
+
+CMD ["/app/server"]

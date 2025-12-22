@@ -1,0 +1,177 @@
+package v1
+
+import (
+	"context"
+
+	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	pb "{{.GoModuleName}}/api/proto/v1"
+	dto "{{.GoModuleName}}/internal/core/dto/v1"
+	"{{.GoModuleName}}/internal/core/port"
+)
+
+type {{.EntityName}}GrpcHandler struct {
+	pb.Unimplemented{{.EntityName}}ServiceServer
+	svc port.{{.EntityName}}Service
+}
+
+func New{{.EntityName}}GrpcHandler(svc port.{{.EntityName}}Service) *{{.EntityName}}GrpcHandler {
+	return &{{.EntityName}}GrpcHandler{svc: svc}
+}
+
+func (h *{{.EntityName}}GrpcHandler) Create(ctx context.Context, req *pb.{{.EntityName}}Request) (*pb.{{.EntityName}}Response, error) {
+	// Mapped to DTO (IsActive handled by service default)
+	cmd := dto.Create{{.EntityName}}Request{
+		Name: req.Name,
+	}
+
+	res, err := h.svc.Create(ctx, cmd)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	return &pb.{{.EntityName}}Response{
+		Id:        res.ID,
+		Name:      res.Name,
+		IsActive:  res.IsActive,
+		CreatedAt: timestamppb.New(res.CreatedAt),
+		UpdatedAt: timestamppb.New(res.UpdatedAt),
+	}, nil
+}
+
+func (h *{{.EntityName}}GrpcHandler) Get(ctx context.Context, req *pb.Get{{.EntityName}}Request) (*pb.{{.EntityName}}Response, error) {
+	id, err := uuid.Parse(req.Id)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid uuid")
+	}
+
+	res, err := h.svc.GetByID(ctx, id)
+	if err != nil {
+		return nil, status.Error(codes.NotFound, err.Error())
+	}
+
+	return &pb.{{.EntityName}}Response{
+		Id:        res.ID,
+		Name:      res.Name,
+		IsActive:  res.IsActive,
+		CreatedAt: timestamppb.New(res.CreatedAt),
+		UpdatedAt: timestamppb.New(res.UpdatedAt),
+	}, nil
+}
+
+func (h *{{.EntityName}}GrpcHandler) Update(ctx context.Context, req *pb.Update{{.EntityName}}Request) (*pb.{{.EntityName}}Response, error) {
+	// DTO expects ID as string inside the struct for internal logic
+	cmd := dto.Update{{.EntityName}}Request{
+		ID:       req.Id,
+		Name:     req.Name,
+		IsActive: &req.IsActive,
+	}
+
+	res, err := h.svc.Update(ctx, cmd)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	return &pb.{{.EntityName}}Response{
+		Id:        res.ID,
+		Name:      res.Name,
+		IsActive:  res.IsActive,
+		CreatedAt: timestamppb.New(res.CreatedAt),
+		UpdatedAt: timestamppb.New(res.UpdatedAt),
+	}, nil
+}
+
+func (h *{{.EntityName}}GrpcHandler) Delete(ctx context.Context, req *pb.Delete{{.EntityName}}Request) (*pb.Empty, error) {
+	id, err := uuid.Parse(req.Id)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "invalid uuid")
+	}
+
+	if err := h.svc.Delete(ctx, id); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	return &pb.Empty{}, nil
+}
+
+func (h *{{.EntityName}}GrpcHandler) List(ctx context.Context, req *pb.List{{.EntityName}}Request) (*pb.List{{.EntityName}}Response, error) {
+	var isActive *bool
+	if req.IsActive != nil {
+		isActive = req.IsActive
+	}
+
+	query := dto.List{{.EntityName}}Request{
+		Page:      int(req.Page),
+		PageSize:  int(req.PageSize),
+		SortBy:    req.SortBy,
+		SortOrder: req.SortOrder,
+		Search:    req.Search,
+		IsActive:  isActive,
+	}
+
+	res, err := h.svc.List(ctx, query)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	var items []*pb.{{.EntityName}}Response
+	for _, v := range res.Data {
+		items = append(items, &pb.{{.EntityName}}Response{
+			Id:        v.ID,
+			Name:      v.Name,
+			IsActive:  v.IsActive,
+			CreatedAt: timestamppb.New(v.CreatedAt),
+			UpdatedAt: timestamppb.New(v.UpdatedAt),
+		})
+	}
+
+	return &pb.List{{.EntityName}}Response{
+		Items:    items,
+		Total:    int32(res.Meta.TotalItems),
+		Page:     int32(res.Meta.CurrentPage),
+		PageSize: int32(res.Meta.PageSize),
+	}, nil
+}
+
+func (h *{{.EntityName}}GrpcHandler) BulkCreate(ctx context.Context, req *pb.BulkCreate{{.EntityName}}Request) (*pb.BulkCreate{{.EntityName}}Response, error) {
+	var cmds []dto.Create{{.EntityName}}Request
+	for _, item := range req.Items {
+		cmds = append(cmds, dto.Create{{.EntityName}}Request{
+			Name: item.Name,
+			// IsActive handled by service default
+		})
+	}
+
+	res, err := h.svc.BulkCreate(ctx, dto.BulkCreate{{.EntityName}}Request{Items: cmds})
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	return &pb.BulkCreate{{.EntityName}}Response{
+		Count: int32(res.SuccessCount),
+		Ids:   res.IDs,
+	}, nil
+}
+
+func (h *{{.EntityName}}GrpcHandler) BulkDelete(ctx context.Context, req *pb.BulkDelete{{.EntityName}}Request) (*pb.Empty, error) {
+	var ids []uuid.UUID
+	for _, idStr := range req.Ids {
+		uid, err := uuid.Parse(idStr)
+		if err == nil {
+			ids = append(ids, uid)
+		}
+	}
+
+	if len(ids) == 0 {
+		return &pb.Empty{}, nil
+	}
+
+	if err := h.svc.BulkDelete(ctx, ids); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	return &pb.Empty{}, nil
+}

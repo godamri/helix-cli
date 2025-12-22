@@ -1,0 +1,219 @@
+package service
+
+import (
+	"context"
+	"log/slog"
+	"time"
+	"math"
+	"encoding/json"
+
+	"github.com/google/uuid"
+	dto "{{.GoModuleName}}/internal/core/dto/v1"
+	"{{.GoModuleName}}/internal/core/entity"
+	"{{.GoModuleName}}/internal/core/port"
+)
+
+type {{.EntityName}}Service struct {
+	repo       port.{{.EntityName}}Repository
+	outboxRepo port.OutboxRepository
+	txManager  port.TxManager
+	logger     *slog.Logger
+}
+
+func New{{.EntityName}}Service(
+	repo port.{{.EntityName}}Repository, 
+	outbox port.OutboxRepository,
+	tx port.TxManager,
+) port.{{.EntityName}}Service {
+	return &{{.EntityName}}Service{
+		repo:       repo,
+		outboxRepo: outbox,
+		txManager:  tx,
+		logger:     slog.Default().With("service", "{{.EntityName}}"),
+	}
+}
+
+// --- CORE CRUD ---
+
+func (s *{{.EntityName}}Service) Create(ctx context.Context, req dto.Create{{.EntityName}}Request) (*dto.{{.EntityName}}Response, error) {
+	var resp *dto.{{.EntityName}}Response
+
+	err := s.txManager.RunInTx(ctx, func(txCtx context.Context) error {
+		e := &entity.{{.EntityName}}{
+			ID:        uuid.New(),
+			Name:      req.Name,
+			IsActive:  true,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+
+		if err := s.repo.Create(txCtx, e); err != nil {
+			return entity.WrapError(entity.EINTERNAL, "persistence_failed", err)
+		}
+
+		// Transactional Outbox
+		if err := s.publishEvent(txCtx, "{{.EntityNameLower}}.created", e); err != nil {
+			return err
+		}
+
+		resp = s.toResponse(e)
+		return nil
+	})
+
+	return resp, err
+}
+
+func (s *{{.EntityName}}Service) GetByID(ctx context.Context, id uuid.UUID) (*dto.{{.EntityName}}Response, error) {
+	e, err := s.repo.FindByID(ctx, id)
+	if err != nil {
+		return nil, entity.WrapError(entity.EINTERNAL, "fetch_failed", err)
+	}
+	if e == nil {
+		return nil, entity.ErrNotFound
+	}
+	return s.toResponse(e), nil
+}
+
+func (s *{{.EntityName}}Service) Update(ctx context.Context, req dto.Update{{.EntityName}}Request) (*dto.{{.EntityName}}Response, error) {
+	var resp *dto.{{.EntityName}}Response
+	id, err := uuid.Parse(req.ID)
+	if err != nil {
+		return nil, entity.WrapError(entity.EINVALID, "invalid_uuid", err)
+	}
+
+	err = s.txManager.RunInTx(ctx, func(txCtx context.Context) error {
+		e, err := s.repo.FindByID(txCtx, id)
+		if err != nil { return err }
+		if e == nil { return entity.ErrNotFound }
+
+		if req.Name != "" { e.Name = req.Name }
+		if req.IsActive != nil { e.IsActive = *req.IsActive }
+		e.UpdatedAt = time.Now()
+
+		if err := s.repo.Update(txCtx, e); err != nil {
+			return entity.WrapError(entity.EINTERNAL, "update_failed", err)
+		}
+
+		if err := s.publishEvent(txCtx, "{{.EntityNameLower}}.updated", e); err != nil {
+			return err
+		}
+
+		resp = s.toResponse(e)
+		return nil
+	})
+
+	return resp, err
+}
+
+func (s *{{.EntityName}}Service) Delete(ctx context.Context, id uuid.UUID) error {
+	return s.txManager.RunInTx(ctx, func(txCtx context.Context) error {
+		if err := s.repo.Delete(txCtx, id); err != nil {
+			return entity.WrapError(entity.EINTERNAL, "delete_failed", err)
+		}
+		return s.publishEvent(txCtx, "{{.EntityNameLower}}.deleted", map[string]string{"id": id.String()})
+	})
+}
+
+func (s *{{.EntityName}}Service) List(ctx context.Context, req dto.List{{.EntityName}}Request) (*dto.List{{.EntityName}}Response, error) {
+	items, total, err := s.repo.List(ctx, req)
+	if err != nil {
+		return nil, entity.WrapError(entity.EINTERNAL, "list_failed", err)
+	}
+
+	dtos := make([]dto.{{.EntityName}}Response, len(items))
+	for i, item := range items {
+		dtos[i] = *s.toResponse(item)
+	}
+
+	return &dto.List{{.EntityName}}Response{
+		Data: dtos,
+		Meta: dto.MetaResponse{
+			CurrentPage: req.Page,
+			PageSize:    req.PageSize,
+			TotalItems:  total,
+			TotalPages:  int(math.Ceil(float64(total) / float64(req.PageSize))),
+		},
+	}, nil
+}
+
+// --- BULK OPERATIONS ---
+
+func (s *{{.EntityName}}Service) BulkCreate(ctx context.Context, req dto.BulkCreate{{.EntityName}}Request) (*dto.BulkCreate{{.EntityName}}Response, error) {
+	var resp *dto.BulkCreate{{.EntityName}}Response
+
+	err := s.txManager.RunInTx(ctx, func(txCtx context.Context) error {
+		entities := make([]*entity.{{.EntityName}}, len(req.Items))
+		ids := make([]string, len(req.Items))
+		now := time.Now()
+
+		for i, item := range req.Items {
+			uid := uuid.New()
+			entities[i] = &entity.{{.EntityName}}{
+				ID: uid, Name: item.Name, IsActive: true, CreatedAt: now, UpdatedAt: now,
+			}
+			ids[i] = uid.String()
+		}
+
+		if err := s.repo.BulkCreate(txCtx, entities); err != nil {
+			return entity.WrapError(entity.EINTERNAL, "bulk_create_failed", err)
+		}
+
+		resp = &dto.BulkCreate{{.EntityName}}Response{SuccessCount: len(entities), IDs: ids}
+		return s.publishEvent(txCtx, "{{.EntityNameLower}}.bulk_created", resp)
+	})
+
+	return resp, err
+}
+
+func (s *{{.EntityName}}Service) BulkUpdate(ctx context.Context, req dto.BulkUpdate{{.EntityName}}Request) (*dto.BulkUpdate{{.EntityName}}Response, error) {
+	var uuids []uuid.UUID
+	for _, id := range req.IDs {
+		if u, err := uuid.Parse(id); err == nil { uuids = append(uuids, u) }
+	}
+
+	if len(uuids) == 0 {
+		return nil, entity.WrapError(entity.EINVALID, "no_valid_ids", nil)
+	}
+
+	var resp *dto.BulkUpdate{{.EntityName}}Response
+	err := s.txManager.RunInTx(ctx, func(txCtx context.Context) error {
+		n, err := s.repo.BulkUpdateStatus(txCtx, uuids, *req.IsActive)
+		if err != nil {
+			return entity.WrapError(entity.EINTERNAL, "bulk_update_failed", err)
+		}
+
+		resp = &dto.BulkUpdate{{.EntityName}}Response{MatchedCount: len(uuids), UpdatedCount: n}
+		return s.publishEvent(txCtx, "{{.EntityNameLower}}.bulk_updated", resp)
+	})
+
+	return resp, err
+}
+
+func (s *{{.EntityName}}Service) BulkDelete(ctx context.Context, ids []uuid.UUID) error {
+	return s.txManager.RunInTx(ctx, func(txCtx context.Context) error {
+		if err := s.repo.BulkDelete(txCtx, ids); err != nil {
+			return entity.WrapError(entity.EINTERNAL, "bulk_delete_failed", err)
+		}
+		return s.publishEvent(txCtx, "{{.EntityNameLower}}.bulk_deleted", map[string]interface{}{"ids": ids})
+	})
+}
+
+// --- HELPERS ---
+
+func (s *{{.EntityName}}Service) publishEvent(ctx context.Context, topic string, payload interface{}) error {
+	b, _ := json.Marshal(payload)
+	event := port.OutboxEvent{
+		Topic:   topic,
+		Payload: b,
+	}
+	if err := s.outboxRepo.Create(ctx, event); err != nil {
+		return entity.WrapError(entity.EINTERNAL, "outbox_queue_failed", err)
+	}
+	return nil
+}
+
+func (s *{{.EntityName}}Service) toResponse(e *entity.{{.EntityName}}) *dto.{{.EntityName}}Response {
+	return &dto.{{.EntityName}}Response{
+		ID: e.ID.String(), Name: e.Name, IsActive: e.IsActive, CreatedAt: e.CreatedAt, UpdatedAt: e.UpdatedAt,
+	}
+}

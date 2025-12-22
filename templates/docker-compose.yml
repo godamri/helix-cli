@@ -1,0 +1,33 @@
+services:
+  {{ .ProjectName }}:
+    container_name: {{ .ProjectName }}-app
+    build:
+      context: .
+      target: dev
+      dockerfile: Dockerfile
+    ports:
+      - "${PORT:-8080}:8080"
+      - "${GRPC_PORT:-{{ .GrpcPort }}}:{{ .GrpcPort }}"
+    volumes:
+      - .:/app
+      - go-modules:/go/pkg/mod
+    image: godamri/{{ .ProjectName }}:latest
+    env_file:
+      - .env
+    environment:
+      - CGO_ENABLED=1
+      - PORT=8080
+      - DB_DSN=postgres://dev:dev@helix-shared-db:5432/{{ .EntityPluralLower }}?sslmode=disable
+      - KAFKA_BROKERS=helix-shared-redpanda:29092
+      - REDIS_ADDR=helix-shared-redis:6379
+      - REDIS_DB=0
+    networks:
+      - helix-shared-net
+
+volumes:
+  go-modules:
+
+
+networks:
+  helix-shared-net:
+    external: true

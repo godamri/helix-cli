@@ -1,0 +1,42 @@
+package middleware
+
+import (
+	"fmt"
+	"net/http"
+	"time"
+)
+
+type DeprecationConfig struct {
+	Active        bool
+	SunsetDate    time.Time
+	MigrationLink string
+}
+
+func DeprecationMiddleware(cfg DeprecationConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !cfg.Active {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// RFC 8594 Headers
+			w.Header().Set("Deprecation", "true")
+
+			if !cfg.SunsetDate.IsZero() {
+				w.Header().Set("Sunset", cfg.SunsetDate.Format(http.TimeFormat))
+				
+				// Standard Warning Header
+				// 299 - "Miscellaneous Persistent Warning"
+				warnMsg := fmt.Sprintf("299 - \"API deprecated. Shutdown scheduled for %s\"", cfg.SunsetDate.Format(time.RFC3339))
+				w.Header().Set("Warning", warnMsg)
+			}
+
+			if cfg.MigrationLink != "" {
+				w.Header().Set("Link", fmt.Sprintf("<%s>; rel=\"sunset\"", cfg.MigrationLink))
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}

@@ -1,0 +1,22 @@
+package port
+
+import (
+	"context"
+	"github.com/google/uuid"
+	
+	dto "{{ .GoModuleName }}/internal/core/dto/v1"
+)
+
+type {{ .EntityName }}Service interface {
+	// CRUD
+	Create(ctx context.Context, req dto.Create{{ .EntityName }}Request) (*dto.{{ .EntityName }}Response, error)
+	GetByID(ctx context.Context, id uuid.UUID) (*dto.{{ .EntityName }}Response, error)
+	Update(ctx context.Context, req dto.Update{{ .EntityName }}Request) (*dto.{{ .EntityName }}Response, error)
+	Delete(ctx context.Context, id uuid.UUID) error
+	List(ctx context.Context, req dto.List{{ .EntityName }}Request) (*dto.List{{ .EntityName }}Response, error)
+	
+	// Bulk
+	BulkCreate(ctx context.Context, req dto.BulkCreate{{ .EntityName }}Request) (*dto.BulkCreate{{ .EntityName }}Response, error)
+	BulkUpdate(ctx context.Context, req dto.BulkUpdate{{ .EntityName }}Request) (*dto.BulkUpdate{{ .EntityName }}Response, error)
+	BulkDelete(ctx context.Context, ids []uuid.UUID) error
+}

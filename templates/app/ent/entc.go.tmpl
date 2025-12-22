@@ -1,0 +1,38 @@
+//go:build ignore
+
+package main
+
+import (
+	"log"
+
+	"entgo.io/contrib/entoas"
+	"entgo.io/ent/entc"
+	"entgo.io/ent/entc/gen"
+	"github.com/ogen-go/ogen"
+)
+
+func main() {
+	ex, err := entoas.NewExtension(
+		entoas.Spec(ogen.NewSpec().
+			SetOpenAPI("3.0.0").
+			SetInfo(ogen.NewInfo().
+				SetTitle("{{ .EntityName }} API").
+				SetVersion("0.0.1"),
+			),
+		),
+	)
+	if err != nil {
+		log.Fatalf("creating entoas extension: %v", err)
+	}
+
+	cfg := gen.Config{
+		Features: []gen.Feature{
+			gen.FeatureModifier,
+			gen.FeatureUpsert,
+		},
+	}
+
+	if err := entc.Generate("./schema", &cfg, entc.Extensions(ex)); err != nil {
+		log.Fatalf("running ent codegen: %v", err)
+	}
+}

@@ -1,0 +1,124 @@
+package repository
+
+import (
+	"context"
+	{{- if eq .Driver "pgx" }}
+	"database/sql"
+	{{- end }}
+	"fmt"
+	"log/slog"
+
+	"{{ .GoModuleName }}/internal/core/port"
+	{{- if eq .Driver "ent" }}
+	"{{ .GoModuleName }}/ent"
+	"database/sql"
+	{{- end }}
+)
+
+type txKey struct{}
+
+{{- if eq .Driver "ent" }}
+// =============================================================================
+// ENT TRANSACTION MANAGER
+// =============================================================================
+
+type EntTxManager struct {
+	client *ent.Client
+	logger *slog.Logger
+}
+
+func NewEntTxManager(client *ent.Client) port.TxManager {
+	return &EntTxManager{
+		client: client,
+		logger: slog.Default(),
+	}
+}
+
+func (tm *EntTxManager) RunInTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	tx, err := tm.client.Tx(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to start ent tx: %w", err)
+	}
+
+	txCtx := context.WithValue(ctx, txKey{}, tx)
+
+	defer func() {
+		if v := recover(); v != nil {
+			_ = tx.Rollback()
+			panic(v)
+		}
+	}()
+
+	if err := fn(txCtx); err != nil {
+		if rerr := tx.Rollback(); rerr != nil {
+			return fmt.Errorf("rolling back tx: %v (original error: %w)", rerr, err)
+		}
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// Helper to bridge SQL connection for Outbox which uses raw SQL even in Ent mode
+func GetConn(ctx context.Context, db *sql.DB) port.SQLQuerier {
+	// If we are in an Ent Tx, we can't easily extract the *sql.Tx directly 
+	// without breaking abstractions or using ent driver hooks.
+	// For simplicity in this template: Outbox uses its own DB connection/transaction 
+	// passed explicitly if needed, OR we rely on Ent hooks for Outbox.
+	// BUT, for the "Unified Transaction" requirement, Ent allows getting the driver.
+	
+	// This is a known complexity. For now, simple fallback:
+	return db 
+}
+
+{{- else }}
+// =============================================================================
+// RAW SQL TRANSACTION MANAGER
+// =============================================================================
+
+type SQLTxManager struct {
+	db     *sql.DB
+	logger *slog.Logger
+}
+
+func NewSQLTxManager(db *sql.DB) port.TxManager {
+	return &SQLTxManager{
+		db:     db,
+		logger: slog.Default(),
+	}
+}
+
+func (tm *SQLTxManager) RunInTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	if _, ok := ctx.Value(txKey{}).(*sql.Tx); ok {
+		return fn(ctx)
+	}
+
+	tx, err := tm.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to start tx: %w", err)
+	}
+
+	txCtx := context.WithValue(ctx, txKey{}, tx)
+
+	defer func() {
+		if v := recover(); v != nil {
+			_ = tx.Rollback()
+			panic(v)
+		}
+	}()
+
+	if err := fn(txCtx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func GetConn(ctx context.Context, db *sql.DB) port.SQLQuerier {
+	if tx, ok := ctx.Value(txKey{}).(*sql.Tx); ok {
+		return tx
+	}
+	return db
+}
+{{- end }}

@@ -1,0 +1,8 @@
+FROM arigaio/atlas:latest-alpine
+
+COPY migrations /migrations
+
+# Default Command
+# Eg: postgres://user:pass@prod-db:5432/dbname?sslmode=disable
+ENTRYPOINT [ "atlas", "migrate", "apply" ]
+CMD [ "--dir", "file://migrations", "--url", "${DB_DSN}" ]

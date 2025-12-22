@@ -1,0 +1,79 @@
+package v1
+
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+
+	"{{ .GoModuleName }}/internal/core/domain"
+	"{{ .GoModuleName }}/internal/core/port"
+)
+
+type {{ .EntityName }}Handler struct {
+	svc port.{{ .EntityName }}Service
+}
+
+func New{{ .EntityName }}Handler(svc port.{{ .EntityName }}Service) *{{ .EntityName }}Handler {
+	return &{{ .EntityName }}Handler{svc: svc}
+}
+
+// Create creates a new {{ .EntityName }}.
+// @Summary      Create {{ .EntityName }}
+// @Description  Create a new {{ .EntityName }} entity
+// @Tags         {{ .EntityNameCamel }}s
+// @Accept       json
+// @Produce      json
+// @Param        request body domain.Create{{ .EntityName }}Request true "Create Request"
+// @Success      200  {object}  domain.{{ .EntityName }}Response
+// @Failure      400  {string}  string "Bad Request"
+// @Failure      500  {string}  string "Internal Server Error"
+// @Router       /{{ .EntityNameCamel }}s [post]
+func (h *{{ .EntityName }}Handler) Create(w http.ResponseWriter, r *http.Request) {
+	var req domain.Create{{ .EntityName }}Request
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	res, err := h.svc.Create(r.Context(), req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}
+
+// GetByID gets an {{ .EntityName }} by ID.
+// @Summary      Get {{ .EntityName }} by ID
+// @Description  Get detailed information of an {{ .EntityName }} by its UUID
+// @Tags         {{ .EntityNameCamel }}s
+// @Accept       json
+// @Produce      json
+// @Param        id   path      string  true  "{{ .EntityName }} ID (UUID)"
+// @Success      200  {object}  domain.{{ .EntityName }}Response
+// @Failure      400  {string}  string "Invalid ID"
+// @Failure      404  {string}  string "Not Found"
+// @Failure      500  {string}  string "Internal Server Error"
+// @Router       /{{ .EntityNameCamel }}s/{id} [get]
+func (h *{{ .EntityName }}Handler) GetByID(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		http.Error(w, "Invalid UUID", http.StatusBadRequest)
+		return
+	}
+
+	res, err := h.svc.GetByID(r.Context(), id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}

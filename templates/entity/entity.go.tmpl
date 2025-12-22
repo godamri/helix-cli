@@ -1,0 +1,12 @@
+package entity
+
+import "time"
+import "github.com/google/uuid"
+
+type {{ .EntityName }} struct {
+	ID        uuid.UUID
+	Name      string
+	IsActive  bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}

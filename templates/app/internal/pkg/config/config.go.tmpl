@@ -1,0 +1,98 @@
+package config
+
+import (
+	"time"
+
+	"github.com/kelseyhightower/envconfig"
+)
+
+var cfg Config
+
+type Config struct {
+	Environment string `envconfig:"APP_ENV" default:"local"`
+	ServiceName string `envconfig:"SERVICE_NAME" default:"{{ .ProjectName }}"`
+	LogFormat   string `envconfig:"LOG_FORMAT" default:"json"`
+
+	// App
+	AppMode    string `envconfig:"APP_MODE" default:"all"`
+	EnableHTTP bool   `envconfig:"ENABLE_HTTP" default:"true"`
+	EnableGRPC bool   `envconfig:"ENABLE_GRPC" default:"true"`
+	AppPort    int    `envconfig:"PORT" default:"8080"`
+	GRPCPort   int    `envconfig:"GRPC_PORT" default:"9090"`
+
+	// Timeouts
+	HTTPReadTimeout  time.Duration `envconfig:"HTTP_READ_TIMEOUT" default:"10s"`
+	HTTPWriteTimeout time.Duration `envconfig:"HTTP_WRITE_TIMEOUT" default:"10s"`
+	ShutdownTimeout  time.Duration `envconfig:"SHUTDOWN_TIMEOUT" default:"10s"`
+
+	// DB
+	DBDSN          string `envconfig:"DB_DSN" required:"true"`
+	DBMaxOpenConns int    `envconfig:"DB_MAX_OPEN_CONNS" default:"25"`
+	DBMaxIdleConns int    `envconfig:"DB_MAX_IDLE_CONNS" default:"5"`
+
+	// Worker DB
+	WorkerDBDSN             string        `envconfig:"WORKER_DB_DSN"`
+	WorkerDBMaxOpenConns    int           `envconfig:"WORKER_DB_MAX_OPEN_CONNS" default:"25"`
+	WorkerDBMaxIdleConns    int           `envconfig:"WORKER_DB_MAX_IDLE_CONNS" default:"5"`
+	WorkerDBConnMaxLifetime time.Duration `envconfig:"WORKER_DB_CONN_MAX_LIFETIME" default:"15m"`
+
+	// Worker Tuning
+	WorkerConcurrency  int           `envconfig:"WORKER_CONCURRENCY" default:"10"`
+	WorkerBatchSize    int           `envconfig:"WORKER_BATCH_SIZE" default:"50"`
+	WorkerPollInterval time.Duration `envconfig:"WORKER_POLL_INTERVAL" default:"200ms"`
+
+	WorkerEnableRescue bool `envconfig:"WORKER_ENABLE_RESCUE" default:"false"`
+
+	// Redis
+	RedisAddr     string `envconfig:"REDIS_ADDR"`
+	RedisPassword string `envconfig:"REDIS_PASSWORD"`
+	RedisDB       int    `envconfig:"REDIS_DB" default:"0"`
+
+	// Kafka
+	KafkaBrokers []string `envconfig:"KAFKA_BROKERS"`
+
+	// Auth
+	AuthEnabled         bool          `envconfig:"AUTH_ENABLED" default:"false"`
+	AuthJWKSURL         string        `envconfig:"AUTH_JWKS_URL"`
+	AuthIssuer          string        `envconfig:"AUTH_ISSUER"`
+	JWKSRefreshInterval time.Duration `envconfig:"AUTH_JWKS_REFRESH_INTERVAL" default:"1h"`
+	AuthJWKSMaxStale    time.Duration `envconfig:"AUTH_JWKS_MAX_STALE" default:"24h"`
+
+	// Audit
+	Audit struct {
+		Output     string   `envconfig:"AUDIT_OUTPUT" default:"console"`
+		Topic      string   `envconfig:"AUDIT_TOPIC" default:"system.audit.events"`
+		BufferSize int      `envconfig:"AUDIT_BUFFER_SIZE" default:"100"`
+		MaskFields []string `envconfig:"AUDIT_MASK_FIELDS"`
+	}
+
+	// MTLS
+	MTLSEnabled    bool   `envconfig:"MTLS_ENABLED" default:"false"`
+	MTLSCACert     string `envconfig:"MTLS_CA_CERT"`
+	MTLSServerCert string `envconfig:"MTLS_SERVER_CERT"`
+	MTLSServerKey  string `envconfig:"MTLS_SERVER_KEY"`
+
+	// Rate Limit
+	RateLimitGlobalRate   int           `envconfig:"RATE_LIMIT_GLOBAL_RATE" default:"1000"`
+	RateLimitGlobalBurst  int           `envconfig:"RATE_LIMIT_GLOBAL_BURST" default:"100"`
+	RateLimitGlobalPeriod time.Duration `envconfig:"RATE_LIMIT_GLOBAL_PERIOD" default:"1s"`
+
+	// Idempotency
+	IdempotencyExpiry time.Duration `envconfig:"IDEMPOTENCY_EXPIRY" default:"1h"`
+
+	// Docs
+	DocsEnabled bool `envconfig:"DOCS_ENABLED" default:"true"`
+
+	// Deprecation
+	DeprecationActive bool   `envconfig:"DEPRECATION_ACTIVE" default:"false"`
+	DeprecationSunset string `envconfig:"DEPRECATION_SUNSET"`
+	DeprecationLink   string `envconfig:"DEPRECATION_LINK"`
+}
+
+func Load() error {
+	return envconfig.Process("", &cfg)
+}
+
+func Get() Config {
+	return cfg
+}

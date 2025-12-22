@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package {{ .EntityPluralLower }}.v1;
+
+option go_package = "{{ .GoModuleName }}/api/proto/v1;v1";
+
+import "google/protobuf/timestamp.proto";
+
+// Service definition
+service {{ .EntityName }}Service {
+  rpc Create({{ .EntityName }}Request) returns ({{ .EntityName }}Response);
+  rpc Get(Get{{ .EntityName }}Request) returns ({{ .EntityName }}Response);
+  rpc Update(Update{{ .EntityName }}Request) returns ({{ .EntityName }}Response);
+  rpc Delete(Delete{{ .EntityName }}Request) returns (Empty);
+  rpc List(List{{ .EntityName }}Request) returns (List{{ .EntityName }}Response);
+  
+  // CRUD++ (Bulk Operations)
+  rpc BulkCreate(BulkCreate{{ .EntityName }}Request) returns (BulkCreate{{ .EntityName }}Response);
+  rpc BulkDelete(BulkDelete{{ .EntityName }}Request) returns (Empty);
+}
+
+// Common Messages
+message Empty {}
+
+message {{ .EntityName }}Request {
+  string name = 1;
+  bool is_active = 2;
+}
+
+message {{ .EntityName }}Response {
+  string id = 1;
+  string name = 2;
+  bool is_active = 3;
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+message Get{{ .EntityName }}Request {
+  string id = 1;
+}
+
+message Update{{ .EntityName }}Request {
+  string id = 1;
+  string name = 2;
+  bool is_active = 3;
+}
+
+message Delete{{ .EntityName }}Request {
+  string id = 1;
+}
+
+message List{{ .EntityName }}Request {
+  int32 page = 1;
+  int32 page_size = 2;
+  string sort_by = 3;
+  string sort_order = 4;
+  
+  // Filters (Match with DTO)
+  string search = 5;
+  optional bool is_active = 6; 
+}
+
+message List{{ .EntityName }}Response {
+  repeated {{ .EntityName }}Response items = 1;
+  int32 total = 2;
+  int32 page = 3;
+  int32 page_size = 4;
+}
+
+// Bulk Messages
+message BulkCreate{{ .EntityName }}Request {
+  repeated {{ .EntityName }}Request items = 1;
+}
+
+message BulkCreate{{ .EntityName }}Response {
+  int32 count = 1;
+  repeated string ids = 2;
+}
+
+message BulkDelete{{ .EntityName }}Request {
+  repeated string ids = 1;
+}

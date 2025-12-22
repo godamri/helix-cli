@@ -1,0 +1,101 @@
+package v1
+
+import (
+	"encoding/json"
+	"errors"
+	"net/http"
+	"reflect"
+	"strings"
+	"sync"
+
+	"github.com/go-playground/locales/en"
+	ut "github.com/go-playground/universal-translator"
+	"github.com/go-playground/validator/v10"
+	en_translations "github.com/go-playground/validator/v10/translations/en"
+
+	"github.com/godamri/helix-fnd/http/response"
+	"github.com/godamri/helix-fnd/pkg/contextx"
+)
+
+var (
+	validate     *validator.Validate
+	translator   ut.Translator
+	validateOnce sync.Once
+)
+
+// InitValidator returns a singleton instance of the validator with EN translator.
+func InitValidator() *validator.Validate {
+	validateOnce.Do(func() {
+		en := en.New()
+		uni := ut.New(en, en)
+		trans, _ := uni.GetTranslator("en")
+
+		validate = validator.New()
+		
+		// Register Default English Translations
+		_ = en_translations.RegisterDefaultTranslations(validate, trans)
+
+		// Register custom JSON tag name function
+		validate.RegisterTagNameFunc(func(fld reflect.StructField) string {
+			name := strings.SplitN(fld.Tag.Get("json"), ",", 2)[0]
+			if name == "-" {
+				return ""
+			}
+			return name
+		})
+		
+		translator = trans
+	})
+	return validate
+}
+
+type ValidationDetail struct {
+	Field   string `json:"field"`
+	Code    string `json:"code"`    // Machine readable (e.g., "required", "min")
+	Message string `json:"message"` // Human readable (e.g., "Name is required")
+}
+
+type ValidationErrorResponse struct {
+	Success bool              `json:"success"`
+	Error   ValidationErrBody `json:"error"`
+	Meta    response.Meta     `json:"meta"`
+}
+
+type ValidationErrBody struct {
+	Code    string             `json:"code"`
+	Message string             `json:"message"`
+	Details []ValidationDetail `json:"details"`
+}
+
+func RespondWithValidationErrors(w http.ResponseWriter, r *http.Request, err error) {
+	var ve validator.ValidationErrors
+	if !errors.As(err, &ve) {
+		response.ErrorJSON(w, r, http.StatusBadRequest, "ERR_BAD_REQUEST", err.Error())
+		return
+	}
+
+	details := make([]ValidationDetail, len(ve))
+	for i, fe := range ve {
+		details[i] = ValidationDetail{
+			Field:   fe.Field(),
+			Code:    fe.Tag(), // Standard validator tag (e.g. "required", "email")
+			Message: fe.Translate(translator), // Auto-translated message
+		}
+	}
+
+	payload := ValidationErrorResponse{
+		Success: false,
+		Error: ValidationErrBody{
+			Code:    "ERR_VALIDATION",
+			Message: "Input parameters validation failed",
+			Details: details,
+		},
+		Meta: response.Meta{
+			TraceID: contextx.GetTraceID(r.Context()),
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	json.NewEncoder(w).Encode(payload)
+}

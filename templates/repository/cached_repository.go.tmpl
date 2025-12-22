@@ -1,0 +1,95 @@
+package repository
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+	"github.com/godamri/helix-fnd/pkg/contextx"
+	"log/slog"
+	"github.com/google/uuid"
+
+	"{{ .GoModuleName }}/internal/core/entity"
+	"{{ .GoModuleName }}/internal/core/port"
+)
+
+type Cached{{ .EntityName }}Repository struct {
+	next   port.{{ .EntityName }}Repository
+	rdb    *redis.Client
+	logger *slog.Logger
+	ttl    time.Duration
+}
+
+func NewCached{{ .EntityName }}Repository(next port.{{ .EntityName }}Repository, rdb *redis.Client, logger *slog.Logger) *Cached{{ .EntityName }}Repository {
+	return &Cached{{ .EntityName }}Repository{
+		next:   next,
+		rdb:    rdb,
+		logger: logger,
+		ttl:    15 * time.Minute, 
+	}
+}
+
+func (r *Cached{{ .EntityName }}Repository) cacheKey(id string) string {
+	return fmt.Sprintf("{{ .EntityNameLower }}:%s", id)
+}
+
+func (r *Cached{{ .EntityName }}Repository) Save(ctx context.Context, ent *entity.{{ .EntityName }}) error {
+	if err := r.next.Save(ctx, ent); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *Cached{{ .EntityName }}Repository) FindByID(ctx context.Context, id uuid.UUID) (*entity.{{ .EntityName }}, error) {
+	key := r.cacheKey(id.String())
+	
+	val, err := r.rdb.Get(ctx, key).Result()
+	if err == nil {
+		var ent entity.{{ .EntityName }}
+		if jsonErr := json.Unmarshal([]byte(val), &ent); jsonErr == nil {
+			r.logger.Debug("Cache Hit", "key", key, "trace_id", contextx.GetTraceID(ctx))
+			return &ent, nil
+		}
+		r.logger.Warn("Cache corrupted", "key", key)
+	}
+
+	ent, err := r.next.FindByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if ent == nil {
+		return nil, nil
+	}
+
+	if data, jsonErr := json.Marshal(ent); jsonErr == nil {
+		if setErr := r.rdb.Set(ctx, key, data, r.ttl).Err(); setErr != nil {
+			r.logger.Error("Failed to set cache", "key", key, "error", setErr)
+		}
+	}
+
+	return ent, nil
+}
+
+func (r *Cached{{ .EntityName }}Repository) Update(ctx context.Context, ent *entity.{{ .EntityName }}) error {
+	if err := r.next.Update(ctx, ent); err != nil {
+		return err
+	}
+	key := r.cacheKey(ent.ID.String())
+	_ = r.rdb.Del(ctx, key)
+	return nil
+}
+
+func (r *Cached{{ .EntityName }}Repository) Delete(ctx context.Context, id uuid.UUID) error {
+	if err := r.next.Delete(ctx, id); err != nil {
+		return err
+	}
+	key := r.cacheKey(id.String())
+	_ = r.rdb.Del(ctx, key)
+	return nil
+}
+
+func (r *Cached{{ .EntityName }}Repository) List(ctx context.Context, limit, offset int, filter dto.List{{ .EntityName }}Request) ([]*entity.{{ .EntityName }}, int, error) {
+	return r.next.List(ctx, limit, offset, filter)
+}
