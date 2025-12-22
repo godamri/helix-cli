@@ -13,21 +13,20 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Version: 0.1.3
+// The Production Janitor: "Fixed the amateur syntax errors. Interfaces are compared to nil, kid."
 var newConsumerCmd = &cobra.Command{
 	Use:     "consumer [name] [topic]",
 	Short:   "Generate a new Kafka Consumer Handler",
 	Example: "  helix-cli new consumer UserCreated user.events.created",
 	Args:    cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// Logger & Context
 		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 		rawName := args[0]
 		topic := args[1]
 
 		consumerName := kebabToPascal(rawName)
-		eventName := consumerName
-		// Standardize filename: consumer_user_created.go
 		fileName := fmt.Sprintf("consumer_%s.go", strings.ReplaceAll(strings.ToLower(rawName), "-", "_"))
 
 		wd, _ := os.Getwd()
@@ -39,24 +38,23 @@ var newConsumerCmd = &cobra.Command{
 			return fmt.Errorf("consumer file '%s' already exists", fileName)
 		}
 
-		// Prepare Data
+		// Prepare Data - Match with templates/consumer/consumer.go.tmpl
 		data := struct {
-			ConsumerName string
-			EventName    string
+			EntityName   string
 			Topic        string
+			GoModuleName string
 		}{
-			ConsumerName: consumerName,
-			EventName:    eventName,
+			EntityName:   consumerName,
 			Topic:        topic,
+			GoModuleName: getGoModuleName(wd),
 		}
 
-		// Initialize Fetcher
+		// TemplateFS is an interface (fs.FS), so check against nil.
 		if TemplateFS == nil {
 			return fmt.Errorf("embedded template FS is nil")
 		}
 		fetcher := helixTemplate.NewSmartFetcher(TemplateFS, logger)
 
-		// Read Template Content
 		tmplPath := "templates/consumer/consumer.go.tmpl"
 		content, err := fetcher.ReadFile(tmplPath)
 		if err != nil {
@@ -83,7 +81,7 @@ var newConsumerCmd = &cobra.Command{
 			return fmt.Errorf("failed to write file: %w", err)
 		}
 
-		fmt.Printf("Consumer '%s' generated at %s\n", consumerName, targetFile)
+		fmt.Printf("✅ Consumer '%s' generated at %s\n", consumerName, targetFile)
 		fmt.Println("Don't forget to register it in 'cmd/server/main.go'!")
 
 		return nil

@@ -1,0 +1,64 @@
+package cache
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "time"
+
+    "github.com/redis/go-redis/v9"
+    "log/slog"
+
+
+)
+
+type {{ .StructName }}Cache struct {
+    rdb    *redis.Client
+    logger *slog.Logger
+    prefix string
+}
+
+func New{{ .StructName }}Cache(rdb *redis.Client) *{{ .StructName }}Cache {
+    return &{{ .StructName }}Cache{
+        rdb:    rdb,
+        logger: slog.Default().With("component", "{{ .StructName }}Cache"),
+        prefix: "{{ .LowerStructName }}",
+    }
+}
+
+func (c *{{ .StructName }}Cache) key(id string) string {
+    return fmt.Sprintf("%s:%s", c.prefix, id)
+}
+
+func (c *{{ .StructName }}Cache) Set(ctx context.Context, id string, data interface{}, ttl time.Duration) error {
+    val, err := json.Marshal(data)
+    if err != nil {
+        return fmt.Errorf("cache: marshal failed: %w", err)
+    }
+
+    return c.rdb.Set(ctx, c.key(id), val, ttl).Err()
+
+
+}
+
+func (c *{{ .StructName }}Cache) Get(ctx context.Context, id string, dest interface{}) (bool, error) {
+    val, err := c.rdb.Get(ctx, c.key(id)).Result()
+    if err == redis.Nil {
+        return false, nil
+    }
+    if err != nil {
+        return false, fmt.Errorf("cache: get failed: %w", err)
+    }
+
+    if err := json.Unmarshal([]byte(val), dest); err != nil {
+        return false, fmt.Errorf("cache: unmarshal failed: %w", err)
+    }
+
+    return true, nil
+
+
+}
+
+func (c *{{ .StructName }}Cache) Delete(ctx context.Context, id string) error {
+    return c.rdb.Del(ctx, c.key(id)).Err()
+}

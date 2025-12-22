@@ -34,9 +34,11 @@ var newCacheCmd = &cobra.Command{
 		}
 
 		data := struct {
-			StructName string
+			StructName      string
+			LowerStructName string
 		}{
-			StructName: structName,
+			StructName:      structName,
+			LowerStructName: strings.ToLower(structName),
 		}
 
 		// Use TemplateFS & SmartFetcher
