@@ -273,13 +273,39 @@ func run(ctx context.Context, logger *slog.Logger) error {
 
 		if cfg.EnableGRPC {
 			grpcHandler := handlerV1.New{{ .EntityName }}GrpcHandler(svc)
-			opts := []grpc.ServerOption{grpc.UnaryInterceptor(fndMiddleware.GRPCRecoveryInterceptor)}
-			if authMiddleware != nil {
-				opts = append(opts, grpc.UnaryInterceptor(authMiddleware.GRPCUnaryInterceptor))
+			
+			// Rule: Explicit interceptor chaining.
+			// Order matters: Recovery -> Auth -> Rate Limit.
+			unaryInterceptors := []grpc.UnaryServerInterceptor{
+				fndMiddleware.GRPCRecoveryInterceptor,
 			}
+
+			if authMiddleware != nil {
+				unaryInterceptors = append(unaryInterceptors, authMiddleware.GRPCUnaryInterceptor)
+			}
+
+			// Add the Rate Limit guardrail if Redis is available.
+			if rdb != nil {
+				unaryInterceptors = append(unaryInterceptors, fndMiddleware.GRPCRateLimitInterceptor(
+					rdb, 
+					cfg.RateLimitGlobalRate, 
+					cfg.RateLimitGlobalBurst, 
+					cfg.RateLimitGlobalPeriod,
+				))
+			}
+			opts := []grpc.ServerOption{
+				grpc.ChainUnaryInterceptor(unaryInterceptors...),
+			}
+
 			grpcSrv = grpc.NewServer(opts...)
 			pb.Register{{ .EntityName }}ServiceServer(grpcSrv, grpcHandler)
-			reflection.Register(grpcSrv)
+			// Rule: Predictability. Reflection status depends on explicit config.
+			if cfg.GRPCEnableReflection {
+				reflection.Register(grpcSrv)
+				logger.Info("gRPC Reflection enabled")
+			} else {
+				logger.Warn("gRPC Reflection disabled (API Discovery unavailable)")
+			}
 		}
 
 		srv := server.New(server.Config{

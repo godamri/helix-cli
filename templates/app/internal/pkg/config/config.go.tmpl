@@ -20,6 +20,9 @@ type Config struct {
 	AppPort    int    `envconfig:"PORT" default:"8080"`
 	GRPCPort   int    `envconfig:"GRPC_PORT" default:"9090"`
 
+	// gRPC Specific
+	GRPCEnableReflection bool `envconfig:"GRPC_ENABLE_REFLECTION" default:"true"`
+
 	// Timeouts
 	HTTPReadTimeout  time.Duration `envconfig:"HTTP_READ_TIMEOUT" default:"10s"`
 	HTTPWriteTimeout time.Duration `envconfig:"HTTP_WRITE_TIMEOUT" default:"10s"`
