@@ -47,3 +47,5 @@ go.work.sum
 .env.*
 !.env.example
 *.sh
+build
+svc-dummy

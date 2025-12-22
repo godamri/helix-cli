@@ -106,7 +106,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		}
 	} else {
 		logger.Info("Initializing Audit Logger (Console Async)...")
-		al := audit.NewAsyncLogger(os.Stdout, cfg.Audit.BufferSize, logger)
+		al := audit.NewAsyncLogger(os.Stdout, cfg.Audit.BufferSize, cfg.Audit.BlockOnFull, logger)
 		defer al.Close()
 		auditLogger = al
 	}

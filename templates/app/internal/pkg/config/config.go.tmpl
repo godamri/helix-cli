@@ -63,10 +63,11 @@ type Config struct {
 
 	// Audit
 	Audit struct {
-		Output     string   `envconfig:"AUDIT_OUTPUT" default:"console"`
-		Topic      string   `envconfig:"AUDIT_TOPIC" default:"system.audit.events"`
-		BufferSize int      `envconfig:"AUDIT_BUFFER_SIZE" default:"100"`
-		MaskFields []string `envconfig:"AUDIT_MASK_FIELDS"`
+		Output      string   `envconfig:"AUDIT_OUTPUT" default:"console"`
+		Topic       string   `envconfig:"AUDIT_TOPIC" default:"system.audit.events"`
+		BufferSize  int      `envconfig:"AUDIT_BUFFER_SIZE" default:"100"`
+		BlockOnFull bool     `envconfig:"AUDIT_BLOCK_ON_FULL" default:"false"`
+		MaskFields  []string `envconfig:"AUDIT_MASK_FIELDS"`
 	}
 
 	// MTLS
