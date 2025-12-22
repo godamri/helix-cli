@@ -13,6 +13,8 @@ type Config struct {
 	ServiceName string `envconfig:"SERVICE_NAME" default:"{{ .ProjectName }}"`
 	LogFormat   string `envconfig:"LOG_FORMAT" default:"json"`
 
+	StrictMode bool `envconfig:"STRICT_MODE" default:"true"`
+
 	// App
 	AppMode    string `envconfig:"APP_MODE" default:"all"`
 	EnableHTTP bool   `envconfig:"ENABLE_HTTP" default:"true"`

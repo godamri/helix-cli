@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"time" // Used for time.Parse now
+	"time" 
 
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -87,7 +87,7 @@ func main() {
 func run(ctx context.Context, logger *slog.Logger) error {
 	cfg := localConfig.Get()
 
-	logger.Info("Starting {{ .ProjectName }}", "env", cfg.Environment, "infra", "immutable", "driver", "{{ .Driver }}")
+	logger.Info("Starting {{ .ProjectName }}", "env", cfg.Environment, "infra", "immutable", "driver", "{{ .Driver }}", "strict_mode", cfg.StrictMode)
 
 	// -------------------------------------------------------------------------
 	// AUDIT LOGGER SETUP (Async / Kafka)
@@ -165,7 +165,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			cfg.AuthJWKSURL, 
 			cfg.AuthIssuer, 
 			cfg.JWKSRefreshInterval, 
-			cfg.AuthJWKSMaxStale, // Configurable Stale Tolerance
+			cfg.AuthJWKSMaxStale, 
 			logger,
 		)
 		if err != nil {
@@ -176,6 +176,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 
 	// Messaging (BUSINESS EVENTS - SyncProducer)
+	// Acts as both Event Producer AND DLQ Producer
 	var producer worker.EventProducer
 	if len(cfg.KafkaBrokers) > 0 {
 		kafkaProducer, err := messaging.NewProducer(messaging.Config{Brokers: cfg.KafkaBrokers}, logger)
@@ -192,7 +193,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	{{- if eq .Driver "ent" }}
 	repo := repository.New{{ .EntityName }}Repository(entClient)
 	txManager := repository.NewEntTxManager(entClient)
-	{{- else }}
+	{{- end }}
+	{{- if eq .Driver "pgx" }}
 	repo := repository.New{{ .EntityName }}Repository(stdMainDB)
 	txManager := repository.NewSQLTxManager(stdMainDB)
 	{{- end }}
@@ -223,7 +225,6 @@ func run(ctx context.Context, logger *slog.Logger) error {
 				r.Use(authMiddleware.HTTPMiddleware)
 			}
 			
-			// If missing, ensure helix-fnd/audit/audit.go exists with Config struct.
 			r.Use(fndMiddleware.AuditMiddleware(auditLogger, audit.Config{
 				MaskFields: cfg.Audit.MaskFields,
 			}))
@@ -231,13 +232,15 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			if rdb != nil {
 				r.Use(fndMiddleware.RateLimitMiddleware(rdb, cfg.RateLimitGlobalRate, cfg.RateLimitGlobalBurst, cfg.RateLimitGlobalPeriod))
 				
-				// Idempotency: FailOpen=true (Availability over Consistency for Redis failures)
+				// Idempotency: 
+				// STRICT Mode (Financial) = FailOpen: false (Reject if Redis down)
+				// PERMISSIVE Mode (General) = FailOpen: true (Accept if Redis down)
 				r.Use(fndMiddleware.IdempotencyMiddleware(fndMiddleware.IdempotencyConfig{
 					HeaderKey: "Idempotency-Key", 
 					Expiry: cfg.IdempotencyExpiry, 
 					RedisClient: rdb, 
 					Logger: logger,
-					FailOpen: true, 
+					FailOpen: !cfg.StrictMode,
 				}))
 			}
 
@@ -274,8 +277,6 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		if cfg.EnableGRPC {
 			grpcHandler := handlerV1.New{{ .EntityName }}GrpcHandler(svc)
 			
-			// Rule: Explicit interceptor chaining.
-			// Order matters: Recovery -> Auth -> Rate Limit.
 			unaryInterceptors := []grpc.UnaryServerInterceptor{
 				fndMiddleware.GRPCRecoveryInterceptor,
 			}
@@ -284,7 +285,6 @@ func run(ctx context.Context, logger *slog.Logger) error {
 				unaryInterceptors = append(unaryInterceptors, authMiddleware.GRPCUnaryInterceptor)
 			}
 
-			// Add the Rate Limit guardrail if Redis is available.
 			if rdb != nil {
 				unaryInterceptors = append(unaryInterceptors, fndMiddleware.GRPCRateLimitInterceptor(
 					rdb, 
@@ -299,7 +299,6 @@ func run(ctx context.Context, logger *slog.Logger) error {
 
 			grpcSrv = grpc.NewServer(opts...)
 			pb.Register{{ .EntityName }}ServiceServer(grpcSrv, grpcHandler)
-			// Rule: Predictability. Reflection status depends on explicit config.
 			if cfg.GRPCEnableReflection {
 				reflection.Register(grpcSrv)
 				logger.Info("gRPC Reflection enabled")
@@ -323,7 +322,37 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// --- WORKER ---
 	if cfg.AppMode == "all" || cfg.AppMode == "worker" {
 		consumerMgr := messaging.NewConsumerManager(logger)
+		
+		// OUTBOX WORKER
 		outboxWorker := worker.NewOutboxWorker(stdWorkerDB, producer)
+
+		// ---------------------------------------------------------------------
+		// MANUAL CONSUMER WIRING REQUIRED HERE
+		// ---------------------------------------------------------------------
+		// Example wiring with DLQ (using the same producer):
+		/*
+			// 1. Initialize Handler
+			myHandler := worker.NewMyConsumerHandler(svc)
+
+			// 2. Initialize Consumer with DLQ Producer
+			// producer (kafkaProducer) satisfies DLQProducer interface
+			myConsumer, err := messaging.NewConsumer(
+				messaging.ConsumerConfig{
+					Brokers:    cfg.KafkaBrokers,
+					GroupID:    "{{ .ProjectName }}-group",
+					Topic:      "some.topic",
+					MaxRetries: 5,
+					StrictMode: cfg.StrictMode, // Pass the StrictMode config
+				},
+				logger,
+				myHandler.Handle,
+				producer, // <--- PASS PRODUCER AS DLQ
+			)
+			if err != nil { return err }
+
+			// 3. Register
+			consumerMgr.Register(myConsumer)
+		*/
 
 		g.Go(func() error {
 			consumerMgr.Start(groupCtx)
