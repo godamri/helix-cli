@@ -6,8 +6,8 @@ services:
       target: dev
       dockerfile: Dockerfile
     ports:
-      - "${PORT:-8080}:8080"
-      - "${GRPC_PORT:-{{ .GrpcPort }}}:{{ .GrpcPort }}"
+      - "${HTTP_PUBLIC_PORT:-8080}:8080"
+      - "${GRPC_PUBLIC_PORT:-{{ .GrpcPort }}}:9090"
     volumes:
       - .:/app
       - go-modules:/go/pkg/mod
@@ -16,11 +16,12 @@ services:
       - .env
     environment:
       - CGO_ENABLED=1
-      - PORT=8080
-      - DB_DSN=postgres://dev:dev@helix-shared-db:5432/{{ .EntityPluralLower }}?sslmode=disable
-      - KAFKA_BROKERS=helix-shared-redpanda:29092
-      - REDIS_ADDR=helix-shared-redis:6379
-      - REDIS_DB=0
+      - HTTP_PORT=${HTTP_PORT}
+      - DB_DSN=${DB_DSN}
+      - KAFKA_BROKERS=${KAFKA_BROKERS}
+      - REDIS_ADDR=${REDIS_ADDR}
+      - REDIS_DB=${REDIS_DB}
+      - OTEL_EXPORTER_OTLP_INSECURE=${OTEL_EXPORTER_OTLP_INSECURE}
     networks:
       - helix-shared-net
 

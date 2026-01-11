@@ -11,6 +11,7 @@ var cfg Config
 type Config struct {
 	Environment string `envconfig:"APP_ENV" default:"local"`
 	ServiceName string `envconfig:"SERVICE_NAME" default:"{{ .ProjectName }}"`
+	LogLevel    string `envconfig:"LOG_LEVEL" default:"info"`
 	LogFormat   string `envconfig:"LOG_FORMAT" default:"json"`
 
 	StrictMode bool `envconfig:"STRICT_MODE" default:"true"`
@@ -19,8 +20,10 @@ type Config struct {
 	AppMode    string `envconfig:"APP_MODE" default:"all"`
 	EnableHTTP bool   `envconfig:"ENABLE_HTTP" default:"true"`
 	EnableGRPC bool   `envconfig:"ENABLE_GRPC" default:"true"`
-	AppPort    int    `envconfig:"PORT" default:"8080"`
+	AppPort    int    `envconfig:"HTTP_PORT" default:"8080"`
 	GRPCPort   int    `envconfig:"GRPC_PORT" default:"9090"`
+	AppPublicPort    int    `envconfig:"HTTP_PUBLIC_PORT" default:"8080"`
+	GRPCPublicPort   int    `envconfig:"GRPC_PUBLIC_PORT" default:"9090"`
 
 	// gRPC Specific
 	GRPCEnableReflection bool `envconfig:"GRPC_ENABLE_REFLECTION" default:"true"`
@@ -55,6 +58,10 @@ type Config struct {
 
 	// Kafka
 	KafkaBrokers []string `envconfig:"KAFKA_BROKERS"`
+
+	// OTel
+	OTelExporterEndpoint string `envconfig:"OTEL_EXPORTER_OTLP_ENDPOINT" default:"localhost:4317"`
+	OTelExporterInsecure bool   `envconfig:"OTEL_EXPORTER_OTLP_INSECURE" default:"true"`
 
 	// Auth
 	AuthEnabled         bool          `envconfig:"AUTH_ENABLED" default:"false"`

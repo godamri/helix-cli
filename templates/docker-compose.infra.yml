@@ -112,6 +112,21 @@ services:
     networks:
       - helix-shared-net
 
+  # ==========================================
+  # SHARED JAEGER (OpenTelemetry)
+  # ==========================================
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: helix-observability
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "4317:4317" # OTLP gRPC receiver
+      - "4318:4318" # OTLP HTTP receiver
+    networks:
+      - helix-shared-net
+
 volumes:
   pg-data:
   redpanda-data:

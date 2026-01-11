@@ -37,6 +37,11 @@ clean-infra: ## Stop shared infrastructure
 	@echo "Cleaning Shared Infrastructure..."
 	@docker compose -p $(SHARED_PROJECT_NAME) -f docker-compose.infra.yml down -v
 	@echo "Infrastructure cleaned."
+reset:
+	@echo "Resetting environment..."
+	@make db-clean
+	@make clean-infra
+	@echo "Reset success"
 
 # ==============================================================================
 # DATABASE UTILS (The Fix)

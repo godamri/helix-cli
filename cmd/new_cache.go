@@ -71,7 +71,7 @@ var newCacheCmd = &cobra.Command{
 			return fmt.Errorf("failed to write file: %w", err)
 		}
 
-		fmt.Printf("✅ Cache repository '%s' generated at %s\n", structName, targetFile)
+		fmt.Printf("Cache repository '%s' generated at %s\n", structName, targetFile)
 		return nil
 	},
 }

@@ -13,8 +13,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Version: 0.1.3
-// The Production Janitor: "Fixed the amateur syntax errors. Interfaces are compared to nil, kid."
 var newConsumerCmd = &cobra.Command{
 	Use:     "consumer [name] [topic]",
 	Short:   "Generate a new Kafka Consumer Handler",
@@ -81,7 +79,7 @@ var newConsumerCmd = &cobra.Command{
 			return fmt.Errorf("failed to write file: %w", err)
 		}
 
-		fmt.Printf("✅ Consumer '%s' generated at %s\n", consumerName, targetFile)
+		fmt.Printf("Consumer '%s' generated at %s\n", consumerName, targetFile)
 		fmt.Println("Don't forget to register it in 'cmd/server/main.go'!")
 
 		return nil

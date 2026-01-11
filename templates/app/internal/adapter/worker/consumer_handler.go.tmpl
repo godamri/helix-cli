@@ -1,0 +1,44 @@
+package worker
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+)
+
+type {{ .EntityName }}ConsumerHandler struct {
+	logger *slog.Logger
+}
+
+func New{{ .EntityName }}ConsumerHandler(logger *slog.Logger) *{{ .EntityName }}ConsumerHandler {
+	return &{{ .EntityName }}ConsumerHandler{
+		// Use .EntityNameLower instead of piping to toLower
+		logger: logger.With("component", "{{ .EntityNameLower }}_consumer"),
+	}
+}
+
+func (h *{{ .EntityName }}ConsumerHandler) Handle(ctx context.Context, key, payload []byte) error {
+	h.logger.Info("Consumer received message", "key", string(key), "payload_size", len(payload))
+
+	// --- SIMULATE POISON PILL ---
+	// If we see this key, we intentionally fail to trigger the Retry -> DLQ flow.
+	if string(key) == "FORCE_DLQ" {
+		err := fmt.Errorf("simulated fatal error for key: %s", key)
+		h.logger.Warn("Triggering DLQ flow", "error", err)
+		return err
+	}
+
+	// Normal Processing
+	var data map[string]interface{}
+	if len(payload) > 0 {
+		if err := json.Unmarshal(payload, &data); err != nil {
+			// In a real app, you might want to DLQ this immediately (non-retriable),
+			// but for now, we return error to let the Retry policy handle it.
+			return fmt.Errorf("invalid json: %w", err)
+		}
+	}
+
+	h.logger.Info("Successfully processed message", "key", string(key))
+	return nil
+}

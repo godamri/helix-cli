@@ -6,29 +6,33 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time" 
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
+	"github.com/riandyrn/otelchi"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	// PGX Stdlib is required to bridge the PGX Pool to *sql.DB for Ent/Legacy support
+	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/godamri/helix-fnd/app"
 	"github.com/godamri/helix-fnd/audit"
 	"github.com/godamri/helix-fnd/cache"
 	"github.com/godamri/helix-fnd/crypto"
 	"github.com/godamri/helix-fnd/database"
-	"github.com/godamri/helix-fnd/log"
 	"github.com/godamri/helix-fnd/messaging"
 	"github.com/godamri/helix-fnd/server"
 	"github.com/godamri/helix-fnd/server/health"
@@ -48,6 +52,7 @@ import (
 	"{{ .GoModuleName }}/internal/core/service"
 	localConfig "{{ .GoModuleName }}/internal/pkg/config"
 	customMiddleware "{{ .GoModuleName }}/internal/pkg/middleware"
+	"{{ .GoModuleName }}/internal/pkg/telemetry"
 
 	_ "{{ .GoModuleName }}/docs"
 	httpSwagger "github.com/swaggo/http-swagger"
@@ -66,22 +71,76 @@ func (p *DebugLogProducer) Publish(ctx context.Context, topic string, key string
 // @version         1.1
 // @description     Enterprise Microservice API - {{ if eq .Driver "ent" }}Ent ORM{{ else }}Raw SQL{{ end }} Edition.
 func main() {
-	logger := log.New(log.Config{Level: "info", Format: "json"})
+	// 1. Bootstrap Logger (Basic)
+	logger := setupLogger("info", "json")
 	slog.SetDefault(logger)
 
+	// 2. Load Config
 	if err := localConfig.Load(); err != nil {
 		logger.Error("Failed to load config", "error", err)
 		os.Exit(1)
 	}
 	cfg := localConfig.Get()
 
-	logger = log.New(log.Config{Level: cfg.LogFormat, Format: cfg.LogFormat})
+	// 3. Re-init Logger with Config & OTel Middleware
+	logger = setupLogger(cfg.LogLevel, cfg.LogFormat)
 	slog.SetDefault(logger)
+
+	// 4. Init Tracing (MUST be before app run for OTelHandler to find Spans)
+	tp, err := initTracer(
+		context.Background(), 
+		cfg.ServiceName, 
+		cfg.Environment, 
+		cfg.OTelExporterEndpoint, 
+		cfg.OTelExporterInsecure,
+	)
+	
+	if err != nil {
+		logger.Error("failed to init tracer", "error", err)
+	} else {
+		logger.Info("OpenTelemetry Tracer initialized", "endpoint", cfg.OTelExporterEndpoint, "insecure", cfg.OTelExporterInsecure)
+		
+		defer func() {
+			if err := tp.Shutdown(context.Background()); err != nil {
+				logger.Error("failed to shutdown tracer", "error", err)
+			}
+		}()
+	}
 
 	runner := app.NewRunner(logger)
 	runner.Run(func(ctx context.Context) error {
 		return run(ctx, logger)
 	})
+}
+
+func setupLogger(levelStr, format string) *slog.Logger {
+	var level slog.Level
+	switch strings.ToLower(levelStr) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{
+		Level: level,
+	}
+
+	var baseHandler slog.Handler
+	if strings.ToLower(format) == "text" {
+		baseHandler = slog.NewTextHandler(os.Stdout, opts)
+	} else {
+		baseHandler = slog.NewJSONHandler(os.Stdout, opts)
+	}
+
+	// WRAP WITH OTel HANDLER
+	otelHandler := telemetry.NewOTelHandler(baseHandler)
+	
+	return slog.New(otelHandler)
 }
 
 func run(ctx context.Context, logger *slog.Logger) error {
@@ -106,44 +165,51 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		}
 	} else {
 		logger.Info("Initializing Audit Logger (Console Async)...")
+		
+		// Setup Audit Logger compliant with helix-fnd v1.0.4 signature
 		al := audit.NewAsyncLogger(os.Stdout, cfg.Audit.BufferSize, cfg.Audit.BlockOnFull, logger)
+		
 		defer al.Close()
 		auditLogger = al
 	}
 
-	tp, err := initTracer(cfg.ServiceName, cfg.Environment)
+	// -------------------------------------------------------------------------
+	// DATABASE INIT (PGX Pool -> SQL Bridge)
+	// -------------------------------------------------------------------------
+	
+	mainPool, err := database.NewPostgres(ctx, database.Config{
+		DBDSN:      cfg.DBDSN, 
+		DBMaxConns: int32(cfg.DBMaxOpenConns), 
+		DBMinConns: int32(cfg.DBMaxIdleConns),
+	})
 	if err != nil {
-		logger.Error("failed to init tracer", "error", err)
-	} else {
-		defer tp.Shutdown(context.Background())
+		return fmt.Errorf("main db pool init failed: %w", err)
 	}
-
-	// MAIN DB CONNECTION
-	stdMainDB, err := database.NewPostgres(ctx, database.Config{
-		DSN: cfg.DBDSN, MaxOpenConns: cfg.DBMaxOpenConns, MaxIdleConns: cfg.DBMaxIdleConns,
-	}, "pgx", cfg.ServiceName)
-	if err != nil {
-		return fmt.Errorf("main db init failed: %w", err)
-	}
+	
+	stdMainDB := stdlib.OpenDBFromPool(mainPool)
 	defer stdMainDB.Close()
 
 	// WORKER DB CONNECTION (Bulkhead Pattern)
 	var stdWorkerDB *sql.DB
 	if cfg.WorkerDBDSN != "" && cfg.WorkerDBDSN != cfg.DBDSN {
 		logger.Info("Connecting to Worker Database (Isolated Pool)...")
-		stdWorkerDB, err = database.NewPostgres(ctx, database.Config{
-			DSN: cfg.WorkerDBDSN, MaxOpenConns: cfg.WorkerDBMaxOpenConns, MaxIdleConns: cfg.WorkerDBMaxIdleConns, ConnMaxLifetime: cfg.WorkerDBConnMaxLifetime,
-		}, "pgx", cfg.ServiceName+"-worker")
+		workerPool, err := database.NewPostgres(ctx, database.Config{
+			DBDSN:         cfg.WorkerDBDSN, 
+			DBMaxConns:    int32(cfg.WorkerDBMaxOpenConns), 
+			DBMinConns:    int32(cfg.WorkerDBMaxIdleConns),
+			DBMaxConnLife: cfg.WorkerDBConnMaxLifetime,
+		})
 		if err != nil {
 			return fmt.Errorf("worker db init failed: %w", err)
 		}
+		stdWorkerDB = stdlib.OpenDBFromPool(workerPool)
 		defer stdWorkerDB.Close()
 	} else {
 		stdWorkerDB = stdMainDB
 	}
 
 	{{- if eq .Driver "ent" }}
-	// ENT CLIENT INIT (Reuse OTel-instrumented DB)
+	// ENT CLIENT INIT
 	drv := entsql.OpenDB(dialect.Postgres, stdMainDB)
 	entClient := ent.NewClient(ent.Driver(drv))
 	{{- end }}
@@ -162,6 +228,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	var authMiddleware *fndMiddleware.AuthMiddleware
 	if cfg.AuthEnabled {
 		jwksClient, err := crypto.NewJWKSCachingClient(
+			ctx,
 			cfg.AuthJWKSURL, 
 			cfg.AuthIssuer, 
 			cfg.JWKSRefreshInterval, 
@@ -175,8 +242,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		authMiddleware = fndMiddleware.NewAuthMiddleware(strategy)
 	}
 
-	// Messaging (BUSINESS EVENTS - SyncProducer)
-	// Acts as both Event Producer AND DLQ Producer
+	// Messaging
 	var producer worker.EventProducer
 	if len(cfg.KafkaBrokers) > 0 {
 		kafkaProducer, err := messaging.NewProducer(messaging.Config{Brokers: cfg.KafkaBrokers}, logger)
@@ -202,8 +268,8 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	outboxRepo := repository.NewOutboxRepository(stdMainDB)
 	
 	svc := service.New{{ .EntityName }}Service(repo, outboxRepo, txManager)
-
-	healthChecker := health.NewChecker(stdMainDB, logger)
+	
+	healthChecker := health.NewChecker(mainPool, logger)
 
 	g, groupCtx := errgroup.WithContext(ctx)
 
@@ -215,6 +281,19 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		if cfg.EnableHTTP {
 			httpHandler := handlerV1.New{{ .EntityName }}Handler(svc)
 			r = chi.NewRouter()
+
+			// --- 1. OBSERVABILITY (Must be first) ---
+			// This middleware creates the Root Span for the request
+			r.Use(otelchi.Middleware(cfg.ServiceName, otelchi.WithChiRoutes(r)))
+
+			// --- 2. RESILIENCE & SECURITY BASE (Hardening) ---
+			// Trust Proxy Headers (X-Forwarded-For). Critical for Audit Log & Rate Limiting behind LB.
+			r.Use(middleware.RealIP)
+			// DoS Protection: Limit Request Body to 2MB. Prevents memory exhaustion.
+			r.Use(middleware.RequestSize(2 * 1024 * 1024))
+			// URL Sanitization
+			r.Use(middleware.CleanPath)
+
 			r.Use(fndMiddleware.SecurityHeaders)
 			r.Use(fndMiddleware.TraceIDMiddleware)
 			r.Use(fndMiddleware.MetricsMiddleware)
@@ -225,9 +304,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 				r.Use(authMiddleware.HTTPMiddleware)
 			}
 			
-			r.Use(fndMiddleware.AuditMiddleware(auditLogger, audit.Config{
-				MaskFields: cfg.Audit.MaskFields,
-			}))
+			r.Use(customMiddleware.AuditMiddleware(auditLogger))
 
 			if rdb != nil {
 				r.Use(fndMiddleware.RateLimitMiddleware(rdb, cfg.RateLimitGlobalRate, cfg.RateLimitGlobalBurst, cfg.RateLimitGlobalPeriod))
@@ -308,12 +385,17 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		}
 
 		srv := server.New(server.Config{
-			EnableHTTP: cfg.EnableHTTP, EnableGRPC: cfg.EnableGRPC,
-			HTTPPort: fmt.Sprintf("%d", cfg.AppPort), GRPCPort: fmt.Sprintf("%d", cfg.GRPCPort),
-			HTTPReadTimeout: cfg.HTTPReadTimeout, HTTPWriteTimeout: cfg.HTTPWriteTimeout,
+			EnableHTTP: cfg.EnableHTTP,
+			EnableGRPC: cfg.EnableGRPC,
+			HTTPPort: fmt.Sprintf("%d", cfg.AppPort),
+			GRPCPort: fmt.Sprintf("%d", cfg.GRPCPort),
+			HTTPReadTimeout: cfg.HTTPReadTimeout,
+			HTTPWriteTimeout: cfg.HTTPWriteTimeout,
 			ShutdownTimeout: cfg.ShutdownTimeout,
-			MTLSEnabled: cfg.MTLSEnabled, MTLSCACert: cfg.MTLSCACert,
-			MTLSServerCert: cfg.MTLSServerCert, MTLSServerKey: cfg.MTLSServerKey,
+			MTLSEnabled: cfg.MTLSEnabled,
+			MTLSCACert: cfg.MTLSCACert,
+			MTLSServerCert: cfg.MTLSCACert,
+			MTLSServerKey: cfg.MTLSServerKey,
 		}, logger, r, grpcSrv)
 
 		g.Go(func() error { return srv.Start(groupCtx) })
@@ -322,37 +404,39 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// --- WORKER ---
 	if cfg.AppMode == "all" || cfg.AppMode == "worker" {
 		consumerMgr := messaging.NewConsumerManager(logger)
-		
-		// OUTBOX WORKER
 		outboxWorker := worker.NewOutboxWorker(stdWorkerDB, producer)
 
 		// ---------------------------------------------------------------------
-		// MANUAL CONSUMER WIRING REQUIRED HERE
+		// MANUAL CONSUMER WIRING (ENABLED BY DEFAULT)
 		// ---------------------------------------------------------------------
-		// Example wiring with DLQ (using the same producer):
-		/*
-			// 1. Initialize Handler
-			myHandler := worker.NewMyConsumerHandler(svc)
 
-			// 2. Initialize Consumer with DLQ Producer
-			// producer (kafkaProducer) satisfies DLQProducer interface
-			myConsumer, err := messaging.NewConsumer(
-				messaging.ConsumerConfig{
-					Brokers:    cfg.KafkaBrokers,
-					GroupID:    "{{ .ProjectName }}-group",
-					Topic:      "some.topic",
-					MaxRetries: 5,
-					StrictMode: cfg.StrictMode, // Pass the StrictMode config
-				},
-				logger,
-				myHandler.Handle,
-				producer, // <--- PASS PRODUCER AS DLQ
-			)
-			if err != nil { return err }
+		// 1. Initialize Handler
+		consumerHandler := worker.New{{ .EntityName }}ConsumerHandler(logger)
 
-			// 3. Register
-			consumerMgr.Register(myConsumer)
-		*/
+		// 2. Initialize Consumer with DLQ Producer (using the SAME producer as Outbox)
+		// This creates a circular topology: App -> Outbox -> Kafka -> Consumer -> (Error) -> Kafka (DLQ)
+		consumer, err := messaging.NewConsumer(
+			messaging.ConsumerConfig{
+				Brokers:        cfg.KafkaBrokers,
+				GroupID:        cfg.ServiceName + "-group",
+				Topic:          "{{ .EntityNameLower }}.created", // Listening to self events for demo
+				MaxRetries:     3,                          // 3 Retries before DLQ
+				InitialBackoff: 1 * time.Second,
+				MaxBackoff:     5 * time.Second,
+				DLQTopic:       "{{ .EntityNameLower }}.created.dlq", // Explicit DLQ topic
+				StrictMode:     cfg.StrictMode,
+			},
+			logger,
+			consumerHandler.Handle,
+			producer, // <--- PASSING THE PRODUCER AS DLQ PRODUCER
+		)
+		if err != nil {
+			logger.Error("Failed to init consumer", "error", err)
+			os.Exit(1)
+		}
+
+		// 3. Register to Manager
+		consumerMgr.Register(consumer)
 
 		g.Go(func() error {
 			consumerMgr.Start(groupCtx)
@@ -368,16 +452,47 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	return g.Wait()
 }
 
-func initTracer(name, env string) (*sdktrace.TracerProvider, error) {
-    res, err := resource.New(context.Background(), resource.WithAttributes(
+func initTracer(
+	ctx context.Context, 
+	name string, 
+	env string, 
+	endpoint string, 
+	insecure bool,
+) (*sdktrace.TracerProvider, error) {
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		fmt.Fprintf(os.Stderr, "OTEL ERROR: %v\n", err)
+	}))
+
+	opts := []otlptracegrpc.Option{
+		otlptracegrpc.WithEndpoint(endpoint),
+	}
+	
+	if insecure {
+		opts = append(opts, otlptracegrpc.WithInsecure())
+	}
+
+	exporter, err := otlptracegrpc.New(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create otlp exporter: %w", err)
+	}
+
+    res, err := resource.New(ctx, resource.WithAttributes(
         attribute.String("service.name", name),
         attribute.String("deployment.environment", env),
     ))
     if err != nil {
         return nil, err
     }
-    tp := sdktrace.NewTracerProvider(sdktrace.WithResource(res), sdktrace.WithSampler(sdktrace.AlwaysSample()))
+
+    tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res), 
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+    
+    // Set Global Provider
     otel.SetTracerProvider(tp)
     otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+    
     return tp, nil
 }

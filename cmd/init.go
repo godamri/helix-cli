@@ -12,7 +12,7 @@ import (
 	"unicode"
 
 	"github.com/AlecAivazis/survey/v2"
-	"github.com/godamri/helix-cli/internal/template"
+	helixTemplate "github.com/godamri/helix-cli/internal/template"
 	"github.com/spf13/cobra"
 )
 
@@ -109,7 +109,7 @@ var initCmd = &cobra.Command{
 		goModuleName := fmt.Sprintf("github.com/godamri/%s", projectName)
 		entityFileName := strings.ReplaceAll(rawEntityName, "-", "_")
 
-		data := template.TemplateData{
+		data := helixTemplate.TemplateData{
 			ProjectName:       projectName,
 			GoModuleName:      goModuleName,
 			AppPort:           30000 + r.Intn(10000),
@@ -126,9 +126,9 @@ var initCmd = &cobra.Command{
 		if TemplateFS == nil {
 			return fmt.Errorf("embedded template FS is nil")
 		}
-		fetcher := template.NewSmartFetcher(TemplateFS, logger)
+		fetcher := helixTemplate.NewSmartFetcher(TemplateFS, logger)
 
-		generator := template.NewGenerator(data, fetcher)
+		generator := helixTemplate.NewGenerator(data, fetcher)
 
 		templateFiles := map[string]string{
 			"templates/Makefile":                                         filepath.Join(destinationDir, "Makefile"),
@@ -167,8 +167,9 @@ var initCmd = &cobra.Command{
 			"templates/entity/handler_impl.go.tmpl":      filepath.Join(destinationDir, "internal", "adapter", "handler", "v1", fmt.Sprintf("%s_handler.go", entityFileName)),
 			"templates/entity/grpc_handler_impl.go.tmpl": filepath.Join(destinationDir, "internal", "adapter", "handler", "v1", fmt.Sprintf("%s_grpc_handler.go", entityFileName)),
 
-			"templates/app/internal/core/entity/errors.go.tmpl":    filepath.Join(destinationDir, "internal", "core", "entity", "errors.go"),
-			"templates/app/internal/adapter/worker/outbox.go.tmpl": filepath.Join(destinationDir, "internal", "adapter", "worker", "outbox.go"),
+			"templates/app/internal/core/entity/errors.go.tmpl":              filepath.Join(destinationDir, "internal", "core", "entity", "errors.go"),
+			"templates/app/internal/adapter/worker/outbox.go.tmpl":           filepath.Join(destinationDir, "internal", "adapter", "worker", "outbox.go"),
+			"templates/app/internal/adapter/worker/consumer_handler.go.tmpl": filepath.Join(destinationDir, "internal", "adapter", "worker", fmt.Sprintf("consumer_%s.go", entityFileName)), // Added Consumer Handler
 
 			"templates/app/internal/adapter/handler/validation.go.tmpl": filepath.Join(destinationDir, "internal", "adapter", "handler", "v1", "validation.go"),
 
@@ -178,7 +179,9 @@ var initCmd = &cobra.Command{
 			"templates/app/migrations/.keep":                     filepath.Join(destinationDir, "migrations", ".keep"),
 			"templates/.github/workflows/ci.yml":                 filepath.Join(destinationDir, ".github", "workflows", "ci.yml"),
 
-			"templates/app/internal/core/port/database.go.tmpl": filepath.Join(destinationDir, "internal", "core", "port", "database.go"),
+			"templates/app/internal/core/port/database.go.tmpl":   filepath.Join(destinationDir, "internal", "core", "port", "database.go"),
+			"templates/app/internal/pkg/telemetry/logger.go.tmpl": filepath.Join(destinationDir, "internal", "pkg", "telemetry", "logger.go"),
+			"templates/app/internal/pkg/middleware/audit.go.tmpl": filepath.Join(destinationDir, "internal", "pkg", "middleware", "audit.go"),
 		}
 
 		slog.Info("Starting scaffolding with SmartFetcher...", "driver", driver)

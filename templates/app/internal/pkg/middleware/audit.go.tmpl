@@ -1,0 +1,55 @@
+package middleware
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/godamri/helix-fnd/audit"
+	"github.com/godamri/helix-fnd/pkg/contextx"
+	"go.opentelemetry.io/otel/trace"
+)
+
+func AuditMiddleware(logger audit.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+
+			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+
+			next.ServeHTTP(ww, r)
+
+			actor := contextx.GetAuthPrincipalID(r.Context())
+			if actor == "" {
+				actor = "anonymous"
+			}
+
+			traceID := contextx.GetTraceID(r.Context())
+
+			logCtx := context.Background()
+
+			if span := trace.SpanFromContext(r.Context()); span.SpanContext().IsValid() {
+				logCtx = trace.ContextWithSpanContext(logCtx, span.SpanContext())
+			}
+
+			evt := audit.Event{
+				ActorID:   actor,
+				Action:    fmt.Sprintf("HTTP %s %s", r.Method, r.URL.Path),
+				Resource:  r.URL.Path,
+				Timestamp: start,
+				TraceID:   traceID,
+				Metadata: map[string]string{
+					"http_method": r.Method,
+					"http_status": fmt.Sprintf("%d", ww.Status()),
+					"remote_ip":   r.RemoteAddr,
+					"user_agent":  r.UserAgent(),
+					"latency_ms":  fmt.Sprintf("%d", time.Since(start).Milliseconds()),
+				},
+			}
+
+			_ = logger.Log(logCtx, evt)
+		})
+	}
+}

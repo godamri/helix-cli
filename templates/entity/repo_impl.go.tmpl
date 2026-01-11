@@ -4,9 +4,12 @@ import (
 	"context"
 	{{- if eq .Driver "pgx" }}
 	"database/sql"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
-	"fmt"
+
+	"github.com/jackc/pgx/v5/pgconn"
 	{{- end }}
 	"log/slog"
 	
@@ -191,7 +194,8 @@ func (r *{{ .EntityName }}Repository) Create(ctx context.Context, e *entity.{{ .
 	          VALUES ($1, $2, $3, $4, $5)`
 	_, err := r.conn(ctx).ExecContext(ctx, query, e.ID, e.Name, e.IsActive, e.CreatedAt, e.UpdatedAt)
 	if err != nil {
-		if strings.Contains(err.Error(), "unique_violation") {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return entity.WrapError(entity.ECONFLICT, "duplicate_entry", err)
 		}
 		return err
@@ -216,6 +220,10 @@ func (r *{{ .EntityName }}Repository) Update(ctx context.Context, e *entity.{{ .
 	query := `UPDATE {{ .EntityPluralLower }} SET name = $1, is_active = $2, updated_at = $3 WHERE id = $4`
 	res, err := r.conn(ctx).ExecContext(ctx, query, e.Name, e.IsActive, e.UpdatedAt, e.ID)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return entity.WrapError(entity.ECONFLICT, "duplicate_entry", err)
+		}
 		return err
 	}
 	rows, _ := res.RowsAffected()
@@ -243,7 +251,7 @@ func (r *{{ .EntityName }}Repository) List(ctx context.Context, req dto.List{{ .
 	sortCol := "created_at"
 	if req.SortBy == "name" { sortCol = "name" }
 	order := "DESC"
-	if strings.ToLower(req.SortOrder) == "asc" { order = "ASC" }
+	if strings.ToUpper(req.SortOrder) == "ASC" { order = "ASC" }
 
 	limit := req.PageSize
 	offset := (req.Page - 1) * req.PageSize
@@ -275,18 +283,41 @@ func (r *{{ .EntityName }}Repository) List(ctx context.Context, req dto.List{{ .
 // Bulk Helpers for SQL
 func (r *{{ .EntityName }}Repository) BulkCreate(ctx context.Context, entities []*entity.{{ .EntityName }}) error {
 	if len(entities) == 0 { return nil }
-	// Simplistic bulk insert loop for template. Production should use CopyFrom or multi-value insert builder.
-	// For template simplicity we use a loop here, but user should optimize if >1000 rows.
+
+	valueStrings := make([]string, 0, len(entities))
+	valueArgs := make([]interface{}, 0, len(entities)*5)
+	
+	i := 0
 	for _, e := range entities {
-		if err := r.Create(ctx, e); err != nil { return err }
+		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d)", i*5+1, i*5+2, i*5+3, i*5+4, i*5+5))
+		valueArgs = append(valueArgs, e.ID, e.Name, e.IsActive, e.CreatedAt, e.UpdatedAt)
+		i++
+	}
+
+	query := fmt.Sprintf("INSERT INTO {{ .EntityPluralLower }} (id, name, is_active, created_at, updated_at) VALUES %s", 
+		strings.Join(valueStrings, ","))
+
+	_, err := r.conn(ctx).ExecContext(ctx, query, valueArgs...)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return entity.WrapError(entity.ECONFLICT, "duplicate_entry_in_bulk", err)
+		}
+		return err
 	}
 	return nil
 }
 
 func (r *{{ .EntityName }}Repository) BulkUpdateStatus(ctx context.Context, ids []uuid.UUID, isActive bool) (int, error) {
 	if len(ids) == 0 { return 0, nil }
-	query := `UPDATE {{ .EntityPluralLower }} SET is_active = $1, updated_at = $2 WHERE id = ANY($3)`
-	res, err := r.conn(ctx).ExecContext(ctx, query, isActive, time.Now(), ids)
+	
+	idStrings := make([]string, len(ids))
+	for i, id := range ids {
+		idStrings[i] = id.String()
+    }
+
+	query := `UPDATE {{ .EntityPluralLower }} SET is_active = $1, updated_at = $2 WHERE id = ANY($3::uuid[])`
+	res, err := r.conn(ctx).ExecContext(ctx, query, isActive, time.Now(), idStrings)
 	if err != nil { return 0, err }
 	n, _ := res.RowsAffected()
 	return int(n), nil
@@ -294,8 +325,14 @@ func (r *{{ .EntityName }}Repository) BulkUpdateStatus(ctx context.Context, ids 
 
 func (r *{{ .EntityName }}Repository) BulkDelete(ctx context.Context, ids []uuid.UUID) error {
 	if len(ids) == 0 { return nil }
-	query := `DELETE FROM {{ .EntityPluralLower }} WHERE id = ANY($1)`
-	_, err := r.conn(ctx).ExecContext(ctx, query, ids)
+	
+	idStrings := make([]string, len(ids))
+	for i, id := range ids {
+		idStrings[i] = id.String()
+    }
+
+	query := `DELETE FROM {{ .EntityPluralLower }} WHERE id = ANY($1::uuid[])`
+	_, err := r.conn(ctx).ExecContext(ctx, query, idStrings)
 	return err
 }
 
