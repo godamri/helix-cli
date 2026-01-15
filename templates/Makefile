@@ -55,23 +55,26 @@ wait-db: ## Wait for DB to be healthy (No more sleep 5)
 	done
 	@echo "DB is up!"
 
-db-create: wait-db ## Idempotent DB Creation (Main) & Fresh Init (Shadow)
+db-create: wait-db ## DESTRUCTIVE DB Creation (Main & Shadow) - FORCE RESET
 	@echo "------------------------------------------------------------------"
-	@echo "Ensuring Databases Exist..."
+	@echo "NUKE & RECREATE DATABASES..."
 	@echo "------------------------------------------------------------------"
 	
-	@# Main DB Check & Create
-	@echo "Checking Main DB: $(DB_NAME)..."
-	@docker exec $(CONTAINER_DB) psql -U $(DB_USER) -tc "SELECT 1 FROM pg_database WHERE datname = '$(DB_NAME)'" | grep -q 1 || \
-	(echo "Database $(DB_NAME) not found. Creating..." && \
-	docker exec $(CONTAINER_DB) psql -U $(DB_USER) -c "CREATE DATABASE \"$(DB_NAME)\"")
+	@# Main DB: FORCE RECREATE
+	@echo "Resetting Main DB: $(DB_NAME)..."
+	@# 1. Kill active connections to the DB so we can drop it
+	@docker exec $(CONTAINER_DB) psql -U $(DB_USER) -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$(DB_NAME)';" > /dev/null 2>&1 || true
+	@# 2. Drop if exists
+	@docker exec $(CONTAINER_DB) psql -U $(DB_USER) -d postgres -c "DROP DATABASE IF EXISTS \"$(DB_NAME)\"" || true
+	@# 3. Create fresh
+	@docker exec $(CONTAINER_DB) psql -U $(DB_USER) -d postgres -c "CREATE DATABASE \"$(DB_NAME)\""
 	
 	@# Atlas Shadow DB: FORCE RECREATE
 	@echo "Resetting Atlas Shadow DB: $(DB_NAME)..."
-	@docker exec $(CONTAINER_ATLAS) psql -U $(DB_USER) -c "DROP DATABASE IF EXISTS \"$(DB_NAME)\"" || true
-	@docker exec $(CONTAINER_ATLAS) psql -U $(DB_USER) -c "CREATE DATABASE \"$(DB_NAME)\""
+	@docker exec $(CONTAINER_ATLAS) psql -U $(DB_USER) -d postgres -c "DROP DATABASE IF EXISTS \"$(DB_NAME)\"" || true
+	@docker exec $(CONTAINER_ATLAS) psql -U $(DB_USER) -d postgres -c "CREATE DATABASE \"$(DB_NAME)\""
 	
-	@echo "Databases ready."
+	@echo "Databases nuked and ready."
 
 fix-deps: ## Hard reset go.mod/sum and tidy
 	@echo "Nuking go.sum and forcing tidy..."
@@ -215,6 +218,10 @@ migrate-down: ## Rollback 1 migration version (Use with Caution)
 	  --url $(DB_URL) \
 	  1
 
+migrate-hash: 
+	docker compose run --rm svc-ledger atlas migrate hash \
+	  --dir $(ATLAS_DIR)
+	  
 migrate-status: ## Check migration status
 	docker compose run --rm {{ .ProjectName }} atlas migrate status \
 	  --dir $(ATLAS_DIR) \
