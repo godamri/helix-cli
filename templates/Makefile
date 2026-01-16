@@ -219,7 +219,7 @@ migrate-down: ## Rollback 1 migration version (Use with Caution)
 	  1
 
 migrate-hash: 
-	docker compose run --rm svc-ledger atlas migrate hash \
+	docker compose run --rm {{ .ProjectName }} atlas migrate hash \
 	  --dir $(ATLAS_DIR)
 	  
 migrate-status: ## Check migration status
