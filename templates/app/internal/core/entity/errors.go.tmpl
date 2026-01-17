@@ -3,13 +3,17 @@ package entity
 import (
 	"fmt"
 	"runtime"
+	
+	"github.com/godamri/helix-fnd/http/response"
 )
 
+// Mapping internal codes to Helix Standard Codes
+// Jangan ngarang kode error sendiri. Pake yang ada di helix-fnd/http/response.
 const (
-	EINTERNAL = "internal_error"
-	ECONFLICT = "resource_conflict"
-	EINVALID  = "invalid_input"
-	ENOTFOUND = "resource_not_found"
+	EINTERNAL = response.ErrSystem
+	ECONFLICT = response.ErrConflict
+	EINVALID  = response.ErrValidation
+	ENOTFOUND = response.ErrNotFound
 )
 
 type AppError struct {
@@ -21,7 +25,11 @@ type AppError struct {
 }
 
 func (e *AppError) Error() string {
-	return fmt.Sprintf("[%s] %s (at %s:%d): %v", e.Code, e.Message, e.File, e.Line, e.Err)
+	// Keep logs clean, but allow unwrapping
+	if e.Err != nil {
+		return fmt.Sprintf("[%s] %s: %v", e.Code, e.Message, e.Err)
+	}
+	return fmt.Sprintf("[%s] %s", e.Code, e.Message)
 }
 
 func (e *AppError) Unwrap() error { return e.Err }

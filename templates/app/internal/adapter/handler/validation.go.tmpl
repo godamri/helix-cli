@@ -1,7 +1,6 @@
 package v1
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"reflect"
@@ -14,7 +13,6 @@ import (
 	en_translations "github.com/go-playground/validator/v10/translations/en"
 
 	"github.com/godamri/helix-fnd/http/response"
-	"github.com/godamri/helix-fnd/pkg/contextx"
 )
 
 var (
@@ -55,22 +53,11 @@ type ValidationDetail struct {
 	Message string `json:"message"` // Human readable (e.g., "Name is required")
 }
 
-type ValidationErrorResponse struct {
-	Success bool              `json:"success"`
-	Error   ValidationErrBody `json:"error"`
-	Meta    response.Meta     `json:"meta"`
-}
-
-type ValidationErrBody struct {
-	Code    string             `json:"code"`
-	Message string             `json:"message"`
-	Details []ValidationDetail `json:"details"`
-}
-
 func RespondWithValidationErrors(w http.ResponseWriter, r *http.Request, err error) {
 	var ve validator.ValidationErrors
 	if !errors.As(err, &ve) {
-		response.ErrorJSON(w, r, http.StatusBadRequest, "ERR_BAD_REQUEST", err.Error())
+		// Fallback for non-validation errors (e.g. malformed JSON)
+		response.ErrorJSON(w, r, http.StatusBadRequest, response.ErrBadRequest, err.Error())
 		return
 	}
 
@@ -83,19 +70,12 @@ func RespondWithValidationErrors(w http.ResponseWriter, r *http.Request, err err
 		}
 	}
 
-	payload := ValidationErrorResponse{
-		Success: false,
-		Error: ValidationErrBody{
-			Code:    "ERR_VALIDATION",
-			Message: "Input parameters validation failed",
-			Details: details,
-		},
-		Meta: response.Meta{
-			TraceID: contextx.GetTraceID(r.Context()),
-		},
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
-	json.NewEncoder(w).Encode(payload)
+	// Use Standard Helix-Fnd Error Response with Details
+	response.ErrorJSONWithDetails(
+		w, r, 
+		http.StatusBadRequest, 
+		response.ErrValidation, 
+		"Input parameters validation failed", 
+		details,
+	)
 }

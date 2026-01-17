@@ -15,18 +15,17 @@ type MetaResponse struct {
 }
 
 // ErrorResponse defines the standard error shape for Swagger.
+// Ref: helix-fnd Universal API Standard
 type ErrorResponse struct {
-	Error   ErrorDetail `json:"error"`
-	Meta    ErrorMeta   `json:"meta"`
+	Error ErrorDetail `json:"error"`
 }
 
 type ErrorDetail struct {
-	Code    string `json:"code" example:"ERR_INVALID_INPUT"`
-	Message string `json:"message" example:"Validation failed"`
-}
-
-type ErrorMeta struct {
-	TraceID string `json:"trace_id" example:"a1b2c3d4"`
+	Code      string      `json:"code" example:"VAL_INVALID_INPUT"`
+	Message   string      `json:"message" example:"Validation failed"`
+	RequestID string      `json:"request_id,omitempty" example:"req_123abc"`
+	DocURL    string      `json:"doc_url,omitempty" example:"https://docs.internal/errors#VAL_INVALID_INPUT"`
+	Details   interface{} `json:"details,omitempty"`
 }
 
 // --- ENTITY RESPONSE ---
@@ -58,7 +57,7 @@ type BulkCreate{{ .EntityName }}Response struct {
 // --- UPDATE ---
 
 type Update{{ .EntityName }}Request struct {
-	ID       string `json:"-" swaggerignore:"true"` // ID di-inject dari URL, abaikan di Swagger body
+	ID       string `json:"-" swaggerignore:"true"` // ID injected from URL
 	Name     string `json:"name" validate:"omitempty,min=3,max=100" example:"Super Premium Plan"`
 	IsActive *bool  `json:"is_active" validate:"omitempty" example:"false"`
 }
@@ -91,7 +90,7 @@ type List{{ .EntityName }}Request struct {
 	// Sorting
 	SortBy    string `json:"sort_by" validate:"omitempty,oneof=created_at name" example:"created_at" enums:"created_at,name"`
 	SortOrder string `json:"sort_order" validate:"omitempty,oneof=asc desc" example:"desc" enums:"asc,desc"`
-	
+
 	IncludeDeleted bool `json:"include_deleted" example:"false"`
 }
 
@@ -100,19 +99,19 @@ type List{{ .EntityName }}Response struct {
 	Meta MetaResponse                `json:"meta"`
 }
 
-// CursorPaginationRequest untuk model infinity scroll atau next-page
+// CursorPaginationRequest for infinite scrolling or large datasets
 type CursorPaginationRequest struct {
-	// LastID adalah ID terakhir dari page sebelumnya (Cursor)
+	// LastID is the ID of the last item in the previous page
 	LastID string `json:"last_id" query:"last_id"`
-	// Limit jumlah data per request
+	// Limit items per request
 	Limit int `json:"limit" validate:"required,min=1,max=100" default:"10"`
 	// Search fuzzy search (optional)
 	Search string `json:"search" validate:"omitempty,max=50"`
 }
 
-// CursorPaginationResponse membungkus data dan tanda buat page selanjutnya
+// CursorPaginationResponse wraps data and the next cursor
 type CursorPaginationResponse struct {
 	Data       interface{} `json:"data"`
-	NextCursor string      `json:"next_cursor" example:"uuid-id-terakhir"`
+	NextCursor string      `json:"next_cursor" example:"uuid-last-id"`
 	HasNext    bool        `json:"has_next"`
 }
