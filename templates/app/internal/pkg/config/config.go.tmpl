@@ -79,11 +79,17 @@ type Config struct {
 		MaskFields  []string `envconfig:"AUDIT_MASK_FIELDS"`
 	}
 
-	// MTLS
-	MTLSEnabled    bool   `envconfig:"MTLS_ENABLED" default:"false"`
-	MTLSCACert     string `envconfig:"MTLS_CA_CERT"`
-	MTLSServerCert string `envconfig:"MTLS_SERVER_CERT"`
-	MTLSServerKey  string `envconfig:"MTLS_SERVER_KEY"`
+	// HTTP mTLS
+	HTTPMTLSEnabled    bool   `envconfig:"HTTP_MTLS_ENABLED" default:"false"`
+	HTTPMTLSCACert     string `envconfig:"HTTP_MTLS_CA_CERT"`
+	HTTPMTLSServerCert string `envconfig:"HTTP_MTLS_SERVER_CERT"`
+	HTTPMTLSServerKey  string `envconfig:"HTTP_MTLS_SERVER_KEY"`
+
+	// GRPC mTLS
+	GRPCMTLSEnabled    bool   `envconfig:"GRPC_MTLS_ENABLED" default:"false"`
+	GRPCMTLSCACert     string `envconfig:"GRPC_MTLS_CA_CERT"`
+	GRPCMTLSServerCert string `envconfig:"GRPC_MTLS_SERVER_CERT"`
+	GRPCMTLSServerKey  string `envconfig:"GRPC_MTLS_SERVER_KEY"`
 
 	// Rate Limit
 	RateLimitGlobalRate   int           `envconfig:"RATE_LIMIT_GLOBAL_RATE" default:"1000"`

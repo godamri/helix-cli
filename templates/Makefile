@@ -51,7 +51,7 @@ wait-db: ## Wait for DB to be healthy (No more sleep 5)
 	@echo "Waiting for $(CONTAINER_DB) to be ready..."
 	@until docker exec $(CONTAINER_DB) pg_isready -U $(DB_USER); do \
 		echo "DB is unavailable - sleeping..."; \
-		sleep 3; \
+		sleep 6; \
 	done
 	@echo "DB is up!"
 
@@ -109,17 +109,18 @@ init: ## Full Setup: Infra -> DB Init -> Deps -> Gen -> Migrate -> Run
 	# but we use 'run --rm' which mounts the code.
 	@make up
 	docker compose run --rm {{ .ProjectName }} go mod download
-	
+
+	@echo "------------------------------------------------------------------"
+	@echo "Cleaning Modules (Tidy)..."
+	@echo "------------------------------------------------------------------"
+	$(MAKE) tidy
+
 	@echo "------------------------------------------------------------------"
 	@echo "Generating Code (Ent & Proto)..."
 	@echo "------------------------------------------------------------------"
 	$(MAKE) ent-gen
 	$(MAKE) proto
 
-	@echo "------------------------------------------------------------------"
-	@echo "Cleaning Modules (Tidy)..."
-	@echo "------------------------------------------------------------------"
-	$(MAKE) tidy
 
 	@echo "------------------------------------------------------------------"
 	@echo "Creating Initial Migration..."
@@ -181,7 +182,7 @@ shell: ## Enter the app container shell (ephemeral)
 # CODE GENERATION
 # ==============================================================================
 
-ent-gen: ## Generate Ent assets from schema
+ent-gen: wait-db ## Generate Ent assets from schema
 	docker compose run --rm {{ .ProjectName }} go run -mod=mod entgo.io/ent/cmd/ent generate --feature sql/modifier,sql/upsert ./ent/schema
 
 proto: ## Generate Protobuf (Containerized)
@@ -199,30 +200,30 @@ ENT_SCHEMA="ent://ent/schema"
 DEV_URL="postgres://dev:dev@helix-shared-db-atlas:5432/{{ .EntityPluralLower }}?sslmode=disable"
 DB_URL="postgres://dev:dev@helix-shared-db:5432/{{ .EntityPluralLower }}?sslmode=disable"
 
-migrate-diff: ## Create migration file (Dev only)
+migrate-diff: wait-db ## Create migration file (Dev only)
 	@if [ -z "$(name)" ]; then echo "Error: name required. Usage: make migrate-diff name=add_users"; exit 1; fi
 	docker compose run --rm {{ .ProjectName }} atlas migrate diff $(name) \
 	  --dir $(ATLAS_DIR) \
 	  --to $(ENT_SCHEMA) \
 	  --dev-url $(DEV_URL)
 
-migrate-apply: ## Apply pending migrations (CI/CD Safe)
+migrate-apply: wait-db ## Apply pending migrations (CI/CD Safe)
 	docker compose run --rm {{ .ProjectName }} atlas migrate apply \
 	  --dir $(ATLAS_DIR) \
 	  --url $(DB_URL)
 
-migrate-down: ## Rollback 1 migration version (Use with Caution)
+migrate-down: wait-db ## Rollback 1 migration version (Use with Caution)
 	@echo "Rolling back the last migration..."
 	docker compose run --rm {{ .ProjectName }} atlas migrate down \
 	  --dir $(ATLAS_DIR) \
 	  --url $(DB_URL) \
 	  1
 
-migrate-hash: 
+migrate-hash: wait-db
 	docker compose run --rm {{ .ProjectName }} atlas migrate hash \
 	  --dir $(ATLAS_DIR)
 	  
-migrate-status: ## Check migration status
+migrate-status: wait-db ## Check migration status
 	docker compose run --rm {{ .ProjectName }} atlas migrate status \
 	  --dir $(ATLAS_DIR) \
 	  --url $(DB_URL)
@@ -234,7 +235,7 @@ migrate-status: ## Check migration status
 clean: ## Remove temp files
 	rm -rf tmp bin
 
-db-clean: ## Stop env & remove ALL Data Volumes (Postgres & Redpanda) - HARD RESET
+db-clean: wait-db ## Stop env & remove ALL Data Volumes (Postgres & Redpanda) - HARD RESET
 	@echo "WARNING: This will delete all database and message broker data!"
 	@echo "Stopping services and removing volumes..."
 	docker compose down --volumes --remove-orphans

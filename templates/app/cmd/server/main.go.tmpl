@@ -8,6 +8,8 @@ import (
 	"os"
 	"strings"
 	"time" 
+	"crypto/tls"
+	"crypto/x509"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -16,6 +18,7 @@ import (
 	"github.com/riandyrn/otelchi"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/reflection"
 
 	"go.opentelemetry.io/otel"
@@ -25,7 +28,6 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
-	// PGX Stdlib is required to bridge the PGX Pool to *sql.DB for Ent/Legacy support
 	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/godamri/helix-fnd/app"
@@ -68,25 +70,25 @@ func (p *DebugLogProducer) Publish(ctx context.Context, topic string, key string
 }
 
 // @title           {{ .ProjectName }} API
-// @version         1.1
+// @version         1.2
 // @description     Enterprise Microservice API - {{ if eq .Driver "ent" }}Ent ORM{{ else }}Raw SQL{{ end }} Edition.
 func main() {
-	// 1. Bootstrap Logger (Basic)
+	// Bootstrap Logger (Basic)
 	logger := setupLogger("info", "json")
 	slog.SetDefault(logger)
 
-	// 2. Load Config
+	// Load Config
 	if err := localConfig.Load(); err != nil {
 		logger.Error("Failed to load config", "error", err)
 		os.Exit(1)
 	}
 	cfg := localConfig.Get()
 
-	// 3. Re-init Logger with Config & OTel Middleware
+	// Re-init Logger with Config & OTel Middleware
 	logger = setupLogger(cfg.LogLevel, cfg.LogFormat)
 	slog.SetDefault(logger)
 
-	// 4. Init Tracing (MUST be before app run for OTelHandler to find Spans)
+	// Init Tracing
 	tp, err := initTracer(
 		context.Background(), 
 		cfg.ServiceName, 
@@ -116,19 +118,13 @@ func main() {
 func setupLogger(levelStr, format string) *slog.Logger {
 	var level slog.Level
 	switch strings.ToLower(levelStr) {
-	case "debug":
-		level = slog.LevelDebug
-	case "warn":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
-		level = slog.LevelInfo
+	case "debug": level = slog.LevelDebug
+	case "warn":  level = slog.LevelWarn
+	case "error": level = slog.LevelError
+	default:      level = slog.LevelInfo
 	}
 
-	opts := &slog.HandlerOptions{
-		Level: level,
-	}
+	opts := &slog.HandlerOptions{Level: level}
 
 	var baseHandler slog.Handler
 	if strings.ToLower(format) == "text" {
@@ -137,46 +133,42 @@ func setupLogger(levelStr, format string) *slog.Logger {
 		baseHandler = slog.NewJSONHandler(os.Stdout, opts)
 	}
 
-	// WRAP WITH OTel HANDLER
-	otelHandler := telemetry.NewOTelHandler(baseHandler)
-	
-	return slog.New(otelHandler)
+	return slog.New(telemetry.NewOTelHandler(baseHandler))
 }
 
 func run(ctx context.Context, logger *slog.Logger) error {
 	cfg := localConfig.Get()
 
-	logger.Info("Starting {{ .ProjectName }}", "env", cfg.Environment, "infra", "immutable", "driver", "{{ .Driver }}", "strict_mode", cfg.StrictMode)
+	logger.Info("Starting {{ .ProjectName }}", 
+		"env", cfg.Environment, 
+		"driver", "{{ .Driver }}", 
+		"strict_mode", cfg.StrictMode,
+		"mtls_http", cfg.HTTPMTLSEnabled,
+		"mtls_grpc", cfg.GRPCMTLSEnabled,
+	)
 
 	// -------------------------------------------------------------------------
 	// AUDIT LOGGER SETUP (Async / Kafka)
 	// -------------------------------------------------------------------------
 	var auditLogger audit.Logger
-	var err error
-
 	if len(cfg.KafkaBrokers) > 0 && cfg.Audit.Output == "kafka" {
 		logger.Info("Initializing Audit Logger (Kafka Async)...")
-		auditLogger, err = audit.NewKafkaLogger(cfg.KafkaBrokers, cfg.Audit.Topic)
+		al, err := audit.NewKafkaLogger(cfg.KafkaBrokers, cfg.Audit.Topic)
 		if err != nil {
 			return fmt.Errorf("failed to init audit kafka logger: %w", err)
 		}
-		if closer, ok := auditLogger.(interface{ Close() error }); ok {
-			defer closer.Close()
-		}
+		defer al.Close()
+		auditLogger = al
 	} else {
 		logger.Info("Initializing Audit Logger (Console Async)...")
-		
-		// Setup Audit Logger compliant with helix-fnd v1.0.4 signature
 		al := audit.NewAsyncLogger(os.Stdout, cfg.Audit.BufferSize, cfg.Audit.BlockOnFull, logger)
-		
 		defer al.Close()
 		auditLogger = al
 	}
 
 	// -------------------------------------------------------------------------
-	// DATABASE INIT (PGX Pool -> SQL Bridge)
+	// DATABASE INIT (Bulkhead Pattern)
 	// -------------------------------------------------------------------------
-	
 	mainPool, err := database.NewPostgres(ctx, database.Config{
 		DBDSN:      cfg.DBDSN, 
 		DBMaxConns: int32(cfg.DBMaxOpenConns), 
@@ -185,11 +177,9 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("main db pool init failed: %w", err)
 	}
-	
 	stdMainDB := stdlib.OpenDBFromPool(mainPool)
 	defer stdMainDB.Close()
 
-	// WORKER DB CONNECTION (Bulkhead Pattern)
 	var stdWorkerDB *sql.DB
 	if cfg.WorkerDBDSN != "" && cfg.WorkerDBDSN != cfg.DBDSN {
 		logger.Info("Connecting to Worker Database (Isolated Pool)...")
@@ -209,53 +199,42 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 
 	{{- if eq .Driver "ent" }}
-	// ENT CLIENT INIT
 	drv := entsql.OpenDB(dialect.Postgres, stdMainDB)
 	entClient := ent.NewClient(ent.Driver(drv))
 	{{- end }}
 
-	// Redis
+	// -------------------------------------------------------------------------
+	// INFRASTRUCTURE INIT (Redis, Auth, Messaging)
+	// -------------------------------------------------------------------------
 	var rdb *redis.Client
 	if cfg.RedisAddr != "" {
 		rdb, err = cache.NewRedis(ctx, cache.Config{Addr: cfg.RedisAddr, Password: cfg.RedisPassword, DB: cfg.RedisDB})
-		if err != nil {
-			return fmt.Errorf("redis init failed: %w", err)
-		}
+		if err != nil { return fmt.Errorf("redis init failed: %w", err) }
 		defer rdb.Close()
 	}
 
 	// Auth
 	var authMiddleware *fndMiddleware.AuthMiddleware
 	if cfg.AuthEnabled {
-		jwksClient, err := crypto.NewJWKSCachingClient(
-			ctx,
-			cfg.AuthJWKSURL, 
-			cfg.AuthIssuer, 
-			cfg.JWKSRefreshInterval, 
-			cfg.AuthJWKSMaxStale, 
-			logger,
-		)
-		if err != nil {
-			return fmt.Errorf("auth init failed: %w", err)
-		}
+		jwksClient, err := crypto.NewJWKSCachingClient(ctx, cfg.AuthJWKSURL, cfg.AuthIssuer, cfg.JWKSRefreshInterval, cfg.AuthJWKSMaxStale, logger)
+		if err != nil { return fmt.Errorf("auth init failed: %w", err) }
 		strategy := fndMiddleware.NewJWTStrategy(jwksClient, logger)
 		authMiddleware = fndMiddleware.NewAuthMiddleware(strategy)
 	}
 
-	// Messaging
 	var producer worker.EventProducer
 	if len(cfg.KafkaBrokers) > 0 {
-		kafkaProducer, err := messaging.NewProducer(messaging.Config{Brokers: cfg.KafkaBrokers}, logger)
-		if err != nil {
-			return fmt.Errorf("kafka init failed: %w", err)
-		}
-		defer kafkaProducer.Close()
-		producer = kafkaProducer
+		kp, err := messaging.NewProducer(messaging.Config{Brokers: cfg.KafkaBrokers}, logger)
+		if err != nil { return fmt.Errorf("kafka init failed: %w", err) }
+		defer kp.Close()
+		producer = kp
 	} else {
 		producer = &DebugLogProducer{logger: logger}
 	}
 
+	// -------------------------------------------------------------------------
 	// WIRING
+	// -------------------------------------------------------------------------
 	{{- if eq .Driver "ent" }}
 	repo := repository.New{{ .EntityName }}Repository(entClient)
 	txManager := repository.NewEntTxManager(entClient)
@@ -266,14 +245,14 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	{{- end }}
 	
 	outboxRepo := repository.NewOutboxRepository(stdMainDB)
-	
 	svc := service.New{{ .EntityName }}Service(repo, outboxRepo, txManager)
-	
 	healthChecker := health.NewChecker(mainPool, logger)
 
 	g, groupCtx := errgroup.WithContext(ctx)
 
-	// --- HTTP/GRPC SERVER ---
+	// -------------------------------------------------------------------------
+	// API SERVERS (HTTP & gRPC)
+	// -------------------------------------------------------------------------
 	if cfg.AppMode == "all" || cfg.AppMode == "api" {
 		var r *chi.Mux
 		var grpcSrv *grpc.Server
@@ -282,62 +261,36 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			httpHandler := handlerV1.New{{ .EntityName }}Handler(svc)
 			r = chi.NewRouter()
 
-			// --- 1. OBSERVABILITY (Must be first) ---
-			// This middleware creates the Root Span for the request
 			r.Use(otelchi.Middleware(cfg.ServiceName, otelchi.WithChiRoutes(r)))
-
-			// --- 2. RESILIENCE & SECURITY BASE (Hardening) ---
-			// Trust Proxy Headers (X-Forwarded-For). Critical for Audit Log & Rate Limiting behind LB.
 			r.Use(middleware.RealIP)
-			// DoS Protection: Limit Request Body to 2MB. Prevents memory exhaustion.
 			r.Use(middleware.RequestSize(2 * 1024 * 1024))
-			// URL Sanitization
 			r.Use(middleware.CleanPath)
-
 			r.Use(fndMiddleware.SecurityHeaders)
 			r.Use(fndMiddleware.TraceIDMiddleware)
 			r.Use(fndMiddleware.MetricsMiddleware)
 			r.Use(fndMiddleware.LoggerMiddleware)
 			r.Use(fndMiddleware.PanicRecovery)
 
-			if authMiddleware != nil {
-				r.Use(authMiddleware.HTTPMiddleware)
-			}
-			
+			if authMiddleware != nil { r.Use(authMiddleware.HTTPMiddleware) }
 			r.Use(customMiddleware.AuditMiddleware(auditLogger))
 
 			if rdb != nil {
 				r.Use(fndMiddleware.RateLimitMiddleware(rdb, cfg.RateLimitGlobalRate, cfg.RateLimitGlobalBurst, cfg.RateLimitGlobalPeriod))
-				
-				// Idempotency: 
-				// STRICT Mode (Financial) = FailOpen: false (Reject if Redis down)
-				// PERMISSIVE Mode (General) = FailOpen: true (Accept if Redis down)
 				r.Use(fndMiddleware.IdempotencyMiddleware(fndMiddleware.IdempotencyConfig{
-					HeaderKey: "Idempotency-Key", 
-					Expiry: cfg.IdempotencyExpiry, 
-					RedisClient: rdb, 
-					Logger: logger,
-					FailOpen: !cfg.StrictMode,
+					HeaderKey: "Idempotency-Key", Expiry: cfg.IdempotencyExpiry, RedisClient: rdb, Logger: logger, FailOpen: !cfg.StrictMode,
 				}))
 			}
 
 			r.Handle("/metrics", promhttp.Handler())
 			healthChecker.RegisterRoutes(r)
-
-			if cfg.DocsEnabled {
-				r.Get("/swagger/*", httpSwagger.Handler(httpSwagger.URL("/swagger/doc.json")))
-			}
+			if cfg.DocsEnabled { r.Get("/swagger/*", httpSwagger.Handler(httpSwagger.URL("/swagger/doc.json"))) }
 
 			r.Route("/v1", func(r chi.Router) {
 				if cfg.DeprecationActive {
-					sunsetTime, err := time.Parse("2006-01-02", cfg.DeprecationSunset)
-					if err != nil {
-						logger.Warn("Invalid deprecation sunset date format, disabling deprecation middleware", "date", cfg.DeprecationSunset, "error", err)
-					} else {
-						r.Use(customMiddleware.DeprecationMiddleware(customMiddleware.DeprecationConfig{
-							Active: true, SunsetDate: sunsetTime, MigrationLink: cfg.DeprecationLink,
-						}))
-					}
+					sunset, _ := time.Parse("2006-01-02", cfg.DeprecationSunset)
+					r.Use(customMiddleware.DeprecationMiddleware(customMiddleware.DeprecationConfig{
+						Active: true, SunsetDate: sunset, MigrationLink: cfg.DeprecationLink,
+					}))
 				}
 				r.Route("/{{ .EntityNameCamel }}s", func(r chi.Router) {
 					r.Post("/", httpHandler.Create)
@@ -353,35 +306,38 @@ func run(ctx context.Context, logger *slog.Logger) error {
 
 		if cfg.EnableGRPC {
 			grpcHandler := handlerV1.New{{ .EntityName }}GrpcHandler(svc)
-			
-			unaryInterceptors := []grpc.UnaryServerInterceptor{
-				fndMiddleware.GRPCRecoveryInterceptor,
-			}
+			unaryInterceptors := []grpc.UnaryServerInterceptor{fndMiddleware.GRPCRecoveryInterceptor}
 
-			if authMiddleware != nil {
-				unaryInterceptors = append(unaryInterceptors, authMiddleware.GRPCUnaryInterceptor)
-			}
-
+			if authMiddleware != nil { unaryInterceptors = append(unaryInterceptors, authMiddleware.GRPCUnaryInterceptor) }
 			if rdb != nil {
-				unaryInterceptors = append(unaryInterceptors, fndMiddleware.GRPCRateLimitInterceptor(
-					rdb, 
-					cfg.RateLimitGlobalRate, 
-					cfg.RateLimitGlobalBurst, 
-					cfg.RateLimitGlobalPeriod,
-				))
+				unaryInterceptors = append(unaryInterceptors, fndMiddleware.GRPCRateLimitInterceptor(rdb, cfg.RateLimitGlobalRate, cfg.RateLimitGlobalBurst, cfg.RateLimitGlobalPeriod))
 			}
-			opts := []grpc.ServerOption{
-				grpc.ChainUnaryInterceptor(unaryInterceptors...),
+			
+			opts := []grpc.ServerOption{grpc.ChainUnaryInterceptor(unaryInterceptors...)}
+
+			// gRPC mTLS Implementation
+			if cfg.GRPCMTLSEnabled {
+				cert, err := tls.LoadX509KeyPair(cfg.GRPCMTLSServerCert, cfg.GRPCMTLSServerKey)
+				if err != nil { return fmt.Errorf("failed to load gRPC certs: %w", err) }
+				
+				ca, err := os.ReadFile(cfg.GRPCMTLSCACert)
+				if err != nil { return fmt.Errorf("failed to read gRPC CA: %w", err) }
+				
+				pool := x509.NewCertPool()
+				pool.AppendCertsFromPEM(ca)
+
+				tlsConfig := &tls.Config{
+					Certificates: []tls.Certificate{cert},
+					ClientAuth:   tls.RequireAndVerifyClientCert,
+					ClientCAs:    pool,
+					MinVersion:   tls.VersionTLS12,
+				}
+				opts = append(opts, grpc.Creds(credentials.NewTLS(tlsConfig)))
 			}
 
 			grpcSrv = grpc.NewServer(opts...)
 			pb.Register{{ .EntityName }}ServiceServer(grpcSrv, grpcHandler)
-			if cfg.GRPCEnableReflection {
-				reflection.Register(grpcSrv)
-				logger.Info("gRPC Reflection enabled")
-			} else {
-				logger.Warn("gRPC Reflection disabled (API Discovery unavailable)")
-			}
+			if cfg.GRPCEnableReflection { reflection.Register(grpcSrv) }
 		}
 
 		srv := server.New(server.Config{
@@ -392,50 +348,39 @@ func run(ctx context.Context, logger *slog.Logger) error {
 			HTTPReadTimeout: cfg.HTTPReadTimeout,
 			HTTPWriteTimeout: cfg.HTTPWriteTimeout,
 			ShutdownTimeout: cfg.ShutdownTimeout,
-			MTLSEnabled: cfg.MTLSEnabled,
-			MTLSCACert: cfg.MTLSCACert,
-			MTLSServerCert: cfg.MTLSCACert,
-			MTLSServerKey: cfg.MTLSServerKey,
+			HTTPMTLSEnabled:    cfg.HTTPMTLSEnabled,
+			HTTPMTLSCACert:     cfg.HTTPMTLSCACert,
+			HTTPMTLSServerCert: cfg.HTTPMTLSServerCert,
+			HTTPMTLSServerKey:  cfg.HTTPMTLSServerKey,
 		}, logger, r, grpcSrv)
 
 		g.Go(func() error { return srv.Start(groupCtx) })
 	}
 
-	// --- WORKER ---
+	// -------------------------------------------------------------------------
+	// ASYNC WORKERS (Outbox & Consumer)
+	// -------------------------------------------------------------------------
 	if cfg.AppMode == "all" || cfg.AppMode == "worker" {
 		consumerMgr := messaging.NewConsumerManager(logger)
 		outboxWorker := worker.NewOutboxWorker(stdWorkerDB, producer)
 
-		// ---------------------------------------------------------------------
-		// MANUAL CONSUMER WIRING (ENABLED BY DEFAULT)
-		// ---------------------------------------------------------------------
-
-		// 1. Initialize Handler
 		consumerHandler := worker.New{{ .EntityName }}ConsumerHandler(logger)
-
-		// 2. Initialize Consumer with DLQ Producer (using the SAME producer as Outbox)
-		// This creates a circular topology: App -> Outbox -> Kafka -> Consumer -> (Error) -> Kafka (DLQ)
 		consumer, err := messaging.NewConsumer(
 			messaging.ConsumerConfig{
 				Brokers:        cfg.KafkaBrokers,
 				GroupID:        cfg.ServiceName + "-group",
-				Topic:          "{{ .EntityNameLower }}.created", // Listening to self events for demo
-				MaxRetries:     3,                          // 3 Retries before DLQ
+				Topic:          "{{ .EntityNameLower }}.created",
+				MaxRetries:     3,
 				InitialBackoff: 1 * time.Second,
 				MaxBackoff:     5 * time.Second,
-				DLQTopic:       "{{ .EntityNameLower }}.created.dlq", // Explicit DLQ topic
+				DLQTopic:       "{{ .EntityNameLower }}.created.dlq",
 				StrictMode:     cfg.StrictMode,
 			},
 			logger,
 			consumerHandler.Handle,
-			producer, // <--- PASSING THE PRODUCER AS DLQ PRODUCER
+			producer,
 		)
-		if err != nil {
-			logger.Error("Failed to init consumer", "error", err)
-			os.Exit(1)
-		}
-
-		// 3. Register to Manager
+		if err != nil { return fmt.Errorf("failed to init consumer: %w", err) }
 		consumerMgr.Register(consumer)
 
 		g.Go(func() error {
@@ -452,47 +397,31 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	return g.Wait()
 }
 
-func initTracer(
-	ctx context.Context, 
-	name string, 
-	env string, 
-	endpoint string, 
-	insecure bool,
-) (*sdktrace.TracerProvider, error) {
+func initTracer(ctx context.Context, name, env, endpoint string, insecure bool) (*sdktrace.TracerProvider, error) {
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
 		fmt.Fprintf(os.Stderr, "OTEL ERROR: %v\n", err)
 	}))
 
-	opts := []otlptracegrpc.Option{
-		otlptracegrpc.WithEndpoint(endpoint),
-	}
-	
-	if insecure {
-		opts = append(opts, otlptracegrpc.WithInsecure())
-	}
+	opts := []otlptracegrpc.Option{otlptracegrpc.WithEndpoint(endpoint)}
+	if insecure { opts = append(opts, otlptracegrpc.WithInsecure()) }
 
 	exporter, err := otlptracegrpc.New(ctx, opts...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create otlp exporter: %w", err)
-	}
+	if err != nil { return nil, err }
 
-    res, err := resource.New(ctx, resource.WithAttributes(
-        attribute.String("service.name", name),
-        attribute.String("deployment.environment", env),
-    ))
-    if err != nil {
-        return nil, err
-    }
+	res, err := resource.New(ctx, resource.WithAttributes(
+		attribute.String("service.name", name),
+		attribute.String("deployment.environment", env),
+	))
+	if err != nil { return nil, err }
 
-    tp := sdktrace.NewTracerProvider(
+	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res), 
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
-    
-    // Set Global Provider
-    otel.SetTracerProvider(tp)
-    otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
-    
-    return tp, nil
+	
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+	
+	return tp, nil
 }

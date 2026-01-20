@@ -117,7 +117,7 @@ services:
   # ==========================================
   jaeger:
     image: jaegertracing/all-in-one:latest
-    container_name: helix-observability
+    container_name: helix-shared-observability
     environment:
       - COLLECTOR_OTLP_ENABLED=true
     ports:
@@ -132,13 +132,13 @@ services:
   minio:
     image: minio/minio:latest
     container_name: helix-shared-minio
-    command: server /data --console-address ":9301"
+    command: server /data --console-address ":9301" --address ":9300"
     ports:
       - "9300:9300" # API Port
       - "9301:9301" # Web Console Port
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: iominuser
+      MINIO_ROOT_PASSWORD: iominuser
     volumes:
       - minio-data:/data
     healthcheck:
